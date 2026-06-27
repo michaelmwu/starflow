@@ -328,7 +328,7 @@ export function App() {
       ) : (
         <section
           id="app"
-          className="mx-auto min-h-[calc(100svh-64px)] w-[min(1120px,calc(100vw-32px))] py-8 md:py-20"
+          className="mx-auto min-h-[calc(100svh-64px)] w-[min(1120px,calc(100vw-24px))] pt-5 pb-44 md:w-[min(1120px,calc(100vw-32px))] md:py-20"
         >
           <div className="mx-auto mb-6 hidden max-w-[720px] text-center md:block">
             <h2 className="font-serif text-4xl text-indigo-soft md:text-5xl">Try the loop now.</h2>
@@ -366,6 +366,7 @@ export function App() {
           {user && screen === "focus" && task ? (
             <FocusPanel
               task={task}
+              onReflect={() => setScreen("reflect")}
               user={user}
               onNewDump={() => setScreen("capture")}
               onToggleStep={(stepId, done) => toggleStepMutation.mutate({ stepId, done })}
@@ -664,10 +665,10 @@ function CapturePanel({
 
   return (
     <div className="mx-auto max-w-[430px] md:max-w-[900px]">
-      <div className="mb-6 flex items-center justify-between">
+      <div className="mb-4 flex items-center justify-between md:mb-6">
         <div className="flex items-center gap-3">
-          <Sparkles className="text-indigo-soft" size={28} />
-          <h2 className="font-serif text-4xl text-starlight">Starflow</h2>
+          <Sparkles className="text-indigo-soft" size={24} />
+          <h2 className="font-serif text-3xl text-starlight md:text-4xl">Starflow</h2>
         </div>
         <button
           type="button"
@@ -678,20 +679,22 @@ function CapturePanel({
         </button>
       </div>
 
-      <div className="relative overflow-hidden rounded-[2.5rem] border border-white/10 bg-indigo-soft/10 p-6 md:p-8">
+      <div className="relative overflow-hidden rounded-[1.75rem] border border-white/10 bg-indigo-soft/10 p-4 md:rounded-[2.5rem] md:p-8">
         <div className="pointer-events-none absolute -right-24 -top-20 size-72 rounded-full bg-indigo-soft/20 blur-3xl" />
         <div className="relative">
-          <p className="font-bold text-indigo-soft text-xs uppercase tracking-[0.22em]">
+          <p className="font-bold text-indigo-soft text-[0.68rem] uppercase tracking-[0.18em] md:text-xs md:tracking-[0.22em]">
             Record and translate
           </p>
-          <h3 className="mt-6 font-serif text-5xl text-starlight leading-tight">
+          <h3 className="mt-3 font-serif text-3xl text-starlight leading-tight md:mt-6 md:text-5xl">
             What's on your mind?
           </h3>
-          <p className="mt-4 text-mist leading-7">{line}</p>
+          <p className="mt-2 text-mist text-sm leading-6 md:mt-4 md:text-base md:leading-7">
+            {line}
+          </p>
         </div>
       </div>
 
-      <div className="mt-5 grid gap-3">
+      <div className="mt-5 hidden gap-3 md:grid">
         {[
           { icon: Lightbulb, text: "I want to build an app.", meta: "Creative spark" },
           { icon: Compass, text: "I forgot to reply to someone.", meta: "Life admin" },
@@ -710,11 +713,11 @@ function CapturePanel({
         ))}
       </div>
 
-      <div className="mt-5 glass rounded-[2rem] p-4">
+      <div className="mt-4 glass rounded-[1.75rem] p-3 md:mt-5 md:rounded-[2rem] md:p-4">
         <div className="relative">
           <textarea
             ref={textareaRef}
-            className="min-h-32 w-full resize-y rounded-[1.5rem] border border-white/10 bg-white/5 p-5 pr-14 text-starlight outline-none transition focus:border-indigo-soft focus:shadow-[0_0_20px_rgba(190,194,255,0.18)]"
+            className="min-h-44 w-full resize-y rounded-[1.35rem] border border-white/10 bg-white/5 p-4 pr-12 text-starlight outline-none transition focus:border-indigo-soft focus:shadow-[0_0_20px_rgba(190,194,255,0.18)] md:min-h-32 md:rounded-[1.5rem] md:p-5 md:pr-14"
             maxLength={8000}
             placeholder="Type a spark of thought..."
             value={dumpText}
@@ -725,7 +728,7 @@ function CapturePanel({
               }
             }}
           />
-          <Mic className="absolute right-5 top-5 text-dim" size={22} />
+          <Mic className="absolute right-4 top-4 text-dim md:right-5 md:top-5" size={22} />
         </div>
         <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
           <span className="text-dim text-sm">{dumpText.length} / 8000</span>
@@ -733,7 +736,7 @@ function CapturePanel({
         </div>
         <button
           type="button"
-          className="button-glow mt-4 inline-flex w-full items-center justify-center gap-3 rounded-full bg-gradient-to-r from-indigo-deep to-indigo-soft px-7 py-5 font-bold text-indigo-deep"
+          className="button-glow mt-4 inline-flex w-full items-center justify-center gap-3 rounded-full bg-gradient-to-r from-indigo-deep to-indigo-soft px-7 py-4 font-bold text-indigo-deep md:py-5"
           disabled={loading || dumpText.trim().length === 0}
           onClick={onSubmit}
         >
@@ -749,17 +752,20 @@ function CapturePanel({
 function FocusPanel({
   onLogout,
   onNewDump,
+  onReflect,
   onToggleStep,
   task,
   user,
 }: {
   onLogout: () => void;
   onNewDump: () => void;
+  onReflect: () => void;
   onToggleStep: (stepId: string, done: boolean) => void;
   task: FocusTask;
   user: User;
 }) {
-  const firstOpenStep = task.steps.find((step) => !step.done) ?? task.steps[0];
+  const firstOpenStep = task.steps.find((step) => !step.done);
+  const allStepsDone = task.steps.length > 0 && task.steps.every((step) => step.done);
 
   return (
     <div className="mx-auto max-w-[430px] md:max-w-[760px]">
@@ -774,18 +780,22 @@ function FocusPanel({
         </button>
       </div>
 
-      <p className="font-bold text-indigo-soft text-sm uppercase tracking-[0.22em]">Focus mode</p>
-      <h3 className="mt-6 font-serif text-5xl text-starlight leading-tight">
+      <p className="font-bold text-indigo-soft text-xs uppercase tracking-[0.18em] md:text-sm md:tracking-[0.22em]">
+        Focus mode
+      </p>
+      <h3 className="mt-4 font-serif text-4xl text-starlight leading-tight md:mt-6 md:text-5xl">
         Let's choose what matters now.
       </h3>
 
-      <div className="glass relative mt-10 rounded-[2.5rem] p-7">
+      <div className="glass relative mt-8 rounded-[2rem] p-6 md:mt-10 md:rounded-[2.5rem] md:p-7">
         <span className="-top-4 absolute rounded-full border border-white/10 bg-void px-5 py-2 font-bold text-dim text-xs uppercase tracking-[0.12em]">
           Main focus today
         </span>
         <div className="mt-8 flex items-start justify-between gap-4">
           <div>
-            <h4 className="font-serif text-4xl text-starlight leading-tight">{task.title}</h4>
+            <h4 className="font-serif text-3xl text-starlight leading-tight md:text-4xl">
+              {task.title}
+            </h4>
             {task.whyItMatters ? (
               <p className="mt-4 text-mist leading-7">{task.whyItMatters}</p>
             ) : null}
@@ -809,14 +819,14 @@ function FocusPanel({
       </div>
 
       {firstOpenStep ? (
-        <div className="mt-12 rounded-[2rem] border border-dashed border-white/20 p-6">
+        <div className="mt-8 rounded-[2rem] border border-dashed border-white/20 p-5 md:mt-12 md:p-6">
           <p className="flex items-center gap-3 font-bold text-gold-soft text-sm uppercase tracking-[0.14em]">
             <span className="size-3 rounded-full bg-gold-soft" />
             Tiny next step
           </p>
           <div className="mt-6 flex items-center justify-between gap-5">
             <div>
-              <p className="text-2xl text-starlight">{firstOpenStep.content}</p>
+              <p className="text-xl text-starlight md:text-2xl">{firstOpenStep.content}</p>
               <p className="mt-3 text-mist italic">It gives your idea shape before building.</p>
             </div>
             <button
@@ -828,6 +838,23 @@ function FocusPanel({
               <Play size={24} fill="currentColor" />
             </button>
           </div>
+        </div>
+      ) : allStepsDone ? (
+        <div className="mt-8 rounded-[2rem] border border-gold-soft/30 bg-gold-soft/10 p-5 md:mt-12 md:p-6">
+          <p className="flex items-center gap-3 font-bold text-gold-soft text-sm uppercase tracking-[0.14em]">
+            <CheckCircle2 size={18} />
+            Flow complete
+          </p>
+          <p className="mt-5 text-xl text-starlight md:text-2xl">
+            The tiny steps are done. Let the win land before choosing more.
+          </p>
+          <button
+            type="button"
+            className="button-glow mt-6 rounded-full bg-gold-soft px-6 py-3 font-bold text-black"
+            onClick={onReflect}
+          >
+            Reflect
+          </button>
         </div>
       ) : null}
 
@@ -1034,7 +1061,7 @@ function BottomNav({
   ];
 
   return (
-    <nav className="fixed right-4 bottom-24 left-4 z-30 mx-auto grid max-w-[430px] grid-cols-3 rounded-full border border-white/10 bg-night/90 p-2 shadow-2xl backdrop-blur-xl md:hidden">
+    <nav className="fixed right-4 bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] left-4 z-30 mx-auto grid max-w-[430px] grid-cols-3 rounded-full border border-white/10 bg-night/90 p-2 shadow-2xl backdrop-blur-xl md:hidden">
       {items.map((item) => (
         <button
           className={`flex flex-col items-center gap-1 rounded-full px-3 py-2 text-xs ${
@@ -1188,14 +1215,16 @@ function AgentDrawer({
     <>
       <button
         type="button"
-        className="button-glow fixed right-5 bottom-5 z-40 grid size-14 place-items-center rounded-full bg-gold-soft text-black shadow-2xl"
+        className={`button-glow fixed right-5 z-40 grid size-14 place-items-center rounded-full bg-gold-soft text-black shadow-2xl ${user ? "bottom-28 md:bottom-5" : "bottom-5"}`}
         onClick={() => onOpenChange(!chatOpen)}
         aria-label="Open Starflow agent"
       >
         <MessageCircle size={23} />
       </button>
       {chatOpen ? (
-        <aside className="fixed right-5 bottom-24 z-40 flex max-h-[70vh] w-[min(420px,calc(100vw-40px))] flex-col overflow-hidden rounded-[2rem] border border-white/10 bg-night/95 shadow-2xl backdrop-blur-xl">
+        <aside
+          className={`fixed right-5 z-40 flex max-h-[70vh] w-[min(420px,calc(100vw-40px))] flex-col overflow-hidden rounded-[2rem] border border-white/10 bg-night/95 shadow-2xl backdrop-blur-xl ${user ? "bottom-44 md:bottom-24" : "bottom-24"}`}
+        >
           <div className="border-white/10 border-b p-4">
             <p className="font-bold text-indigo-soft">{agentLabel}</p>
             <p className="text-dim text-xs">Event router context changes with the page.</p>

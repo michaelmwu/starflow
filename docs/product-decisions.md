@@ -21,16 +21,17 @@ The first screen should be the usable app, not a marketing landing page. The use
 
 The product frames AI as an ADK-style multi-agent system:
 
-- Sense Agent: normalize voice, image, or text into a spark. Image capture is important because a messy room photo can become an emotional spark.
-- Classifier Agent: label the spark as creative, life-admin, emotional, recurring, urgent, or long-term.
-- Triage Agent: ask only the one or two questions that matter for this spark type, such as energy, urgency, emotional load, or time.
-- Coach Agents: Creative Coach, Life-Admin Coach, and Emotional Reset Coach share the same loop with different voice.
-- Breakdown Agent: decompose into tiny steps and pick exactly one first step.
-- Adjustment Agent: receive task edits/completions/resistance and change the active task.
+- Context Agent: normalize voice, text, image, Gmail, Calendar, and existing-task context into structured context. It extracts projects, commitments, deadlines, meetings, people, and emotion, but never creates tasks, prioritizes, or breaks down work.
+- Task Extraction Agent: extracts actionable candidate tasks from structured context, merges duplicates, detects recurring work and deadlines, and sends everything to an inbox. It does not prioritize or choose today's work.
+- Prioritization Agent: prioritizes only user-selected active tasks, optimizing for activation energy, deadlines, dependencies, context switching, energy level, and available time.
+- Breakdown Agent: decomposes selected tasks into executable subtasks with one action and one clear outcome, ideally 5-20 minutes each.
+- Adjustment Agent: receives task edits, completions, and resistance from the active screen, then updates the shared task store.
 
 The assistant should avoid shame, broad motivational advice, and perfection framing. It should prefer concrete next actions, small scopes, and language that supports returning to flow.
 
 The event router receives user events, runs context/task extraction/prioritization/breakdown, writes to the shared task store, and updates the active dashboard.
+
+For the page chat, "acting on the UI" means returning explicit allowed mutations, not freeform advice. Capture may rewrite the current dump text. Focus may rename the active task, replace its tiny steps, or shrink the first incomplete step. Reflect may guide reflection but should not mutate tasks.
 
 ## Demo Script
 

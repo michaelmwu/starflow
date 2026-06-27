@@ -134,7 +134,18 @@ GEMINI_MODEL=gemini-2.5-flash
 
 ## Deploy
 
-The examples below use `--allow-unauthenticated` for fast public hackathon demos. For production, remove that flag and put authentication, rate limiting, quota controls, or an application gateway in front of `/api/generate` to avoid unexpected Gemini spend or abuse.
+The examples below use `--allow-unauthenticated` for fast public hackathon demos. The app still requires Starflow session auth before model calls. For production, remove that flag and put additional rate limiting, quota controls, or an application gateway in front of model-backed APIs to avoid unexpected Gemini spend or abuse.
+
+Cloud Run also needs database and session configuration. Prefer Secret Manager for `DATABASE_URL`, `SESSION_SECRET`, and any API keys:
+
+```bash
+gcloud run deploy saskatoon-ai \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --set-secrets DATABASE_URL=DATABASE_URL:latest,SESSION_SECRET=SESSION_SECRET:latest,GOOGLE_AGENT_PLATFORM_KEY=GOOGLE_AGENT_PLATFORM_KEY:latest \
+  --set-env-vars GOOGLE_CLOUD_PROJECT=your-project-id,GEMINI_PROJECT_NUMBER=your-project-number
+```
 
 Build and deploy from source with Google Cloud Buildpacks:
 
@@ -143,7 +154,7 @@ gcloud run deploy saskatoon-ai \
   --source . \
   --region us-central1 \
   --allow-unauthenticated \
-  --set-env-vars GOOGLE_AGENT_PLATFORM_KEY=your-agent-platform-key,GOOGLE_CLOUD_PROJECT=your-project-id,GEMINI_PROJECT_NUMBER=your-project-number
+  --set-env-vars GOOGLE_AGENT_PLATFORM_KEY=your-agent-platform-key,GOOGLE_CLOUD_PROJECT=your-project-id,GEMINI_PROJECT_NUMBER=your-project-number,DATABASE_URL=postgresql://user:password@host:5432/database,SESSION_SECRET=replace-with-random-secret
 ```
 
 Or build the included container:
@@ -154,7 +165,7 @@ gcloud run deploy saskatoon-ai \
   --image us-central1-docker.pkg.dev/PROJECT_ID/saskatoon/saskatoon-ai \
   --region us-central1 \
   --allow-unauthenticated \
-  --set-env-vars GOOGLE_AGENT_PLATFORM_KEY=your-agent-platform-key,GOOGLE_CLOUD_PROJECT=PROJECT_ID,GEMINI_PROJECT_NUMBER=your-project-number
+  --set-env-vars GOOGLE_AGENT_PLATFORM_KEY=your-agent-platform-key,GOOGLE_CLOUD_PROJECT=PROJECT_ID,GEMINI_PROJECT_NUMBER=your-project-number,DATABASE_URL=postgresql://user:password@host:5432/database,SESSION_SECRET=replace-with-random-secret
 ```
 
 ## Checks

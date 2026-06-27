@@ -39,8 +39,19 @@ Cloud SQL Postgres remains the Google-native production target. Neon or Supabase
 
 ## 2026-06-27: ADK Story Versus Current Runtime
 
-The pitch should describe Starflow as an ADK-style orchestrator with specialist agents: Sense, Classifier, Triage, Coach, Breakdown, and Adjustment.
+The pitch should describe Starflow as an ADK-style orchestrator with specialist agents: Context, Task Extraction, Prioritization, Breakdown, and Adjustment.
 
 The current code implements that contract in Bun/Hono endpoints rather than importing ADK directly. This keeps the hackathon demo shippable while making the boundary explicit: `POST /api/events` is the orchestrator seam that can later become an ADK root agent. If time allows, wrap the same schema in ADK and point the frontend at that endpoint without changing the UI model.
 
 Firestore is the cleaner Google-native shared task store for the ADK story. We are keeping Postgres for now because local dev, migrations, and Cloud SQL are already wired.
+
+## 2026-06-27: Agent UI Mutations
+
+Page agents are allowed to mutate only a narrow, schema-backed surface:
+
+- Capture agent: may return `capture_text` to rewrite the current dump.
+- Focus agent: may return `updated_first_step`, `updated_task_title`, or `updated_steps`.
+- Landing/sign-in agents: may route users into capture but cannot mutate persisted task state.
+- Reflect agent: may guide reflection but cannot mutate tasks.
+
+The server applies focus mutations to Postgres and returns the reloaded task, so the UI and shared task store stay consistent. Freeform chat replies alone are not enough when the user asks the agent to change a visible task.

@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { GoogleGenAI, Type } from "@google/genai";
 import { and, count, desc, eq } from "drizzle-orm";
 import { OAuth2Client } from "google-auth-library";
@@ -10,7 +10,7 @@ import { appUsers, brainDumps, reflections, taskSteps, tasks } from "./db/schema
 const DEFAULT_MODEL = "gemini-2.5-flash";
 const MAX_PROMPT_LENGTH = 8_000;
 const SESSION_COOKIE = "starflow_session";
-const DEMO_EMAIL = "demo@starflow.local";
+const DEMO_EMAIL_DOMAIN = "starflow.local";
 
 type ProviderMode = "gemini-enterprise-agent-platform" | "gemini-developer-api";
 type AgentRole = "landing" | "signin" | "capture" | "focus" | "reflect";
@@ -200,7 +200,13 @@ function createClient(): GoogleGenAI {
 }
 
 function sessionSecret(): string {
-  return envValue("SESSION_SECRET") ?? "local-dev-insecure-starflow-session-secret";
+  const secret = envValue("SESSION_SECRET");
+
+  if (!secret && isProduction()) {
+    throw new Error("SESSION_SECRET is required in production.");
+  }
+
+  return secret ?? "local-dev-insecure-starflow-session-secret";
 }
 
 function signValue(value: string): string {
@@ -237,12 +243,29 @@ function isProduction(): boolean {
   return process.env.NODE_ENV === "production";
 }
 
+function isDemoEmail(email: string): boolean {
+  return email.endsWith(`@${DEMO_EMAIL_DOMAIN}`);
+}
+
+function boundedJson(value: unknown, label: string): string | Response {
+  const text = JSON.stringify(value ?? {});
+
+  if (text.length > MAX_PROMPT_LENGTH) {
+    return Response.json(
+      { error: `${label} must serialize to ${MAX_PROMPT_LENGTH} characters or fewer.` },
+      { status: 400 },
+    );
+  }
+
+  return text;
+}
+
 function publicUser(user: CurrentUser): PublicUser {
   return {
     id: user.id,
     email: user.email,
     displayName: user.displayName,
-    isDemo: user.email === DEMO_EMAIL,
+    isDemo: isDemoEmail(user.email),
   };
 }
 
@@ -262,40 +285,28 @@ async function currentUserFromId(userId: string): Promise<CurrentUser | null> {
     return null;
   }
 
-  return { ...user, isDemo: user.email === DEMO_EMAIL };
+  return { ...user, isDemo: isDemoEmail(user.email) };
 }
 
-async function getOrCreateDemoUser(): Promise<CurrentUser> {
-  await db
+async function createDemoUser(): Promise<CurrentUser> {
+  const [user] = await db
     .insert(appUsers)
     .values({
-      email: DEMO_EMAIL,
+      email: `demo+${randomUUID()}@${DEMO_EMAIL_DOMAIN}`,
       displayName: "Demo",
     })
-    .onConflictDoNothing({ target: appUsers.email });
-
-  const user = await currentUserByEmail(DEMO_EMAIL);
+    .returning({
+      id: appUsers.id,
+      email: appUsers.email,
+      displayName: appUsers.displayName,
+      googleSubject: appUsers.googleSubject,
+    });
 
   if (!user) {
     throw new Error("Demo user was not created.");
   }
 
-  return user;
-}
-
-async function currentUserByEmail(email: string): Promise<CurrentUser | null> {
-  const [user] = await db
-    .select({
-      id: appUsers.id,
-      email: appUsers.email,
-      displayName: appUsers.displayName,
-      googleSubject: appUsers.googleSubject,
-    })
-    .from(appUsers)
-    .where(eq(appUsers.email, email))
-    .limit(1);
-
-  return user ? { ...user, isDemo: user.email === DEMO_EMAIL } : null;
+  return { ...user, isDemo: true };
 }
 
 function allowedEmails(): Set<string> | null {
@@ -445,6 +456,12 @@ function chatSchema() {
       reply: { type: Type.STRING },
       capture_text: { type: Type.STRING, nullable: true },
       updated_first_step: { type: Type.STRING, nullable: true },
+      updated_task_title: { type: Type.STRING, nullable: true },
+      updated_steps: {
+        type: Type.ARRAY,
+        nullable: true,
+        items: { type: Type.STRING },
+      },
       route: { type: Type.STRING, nullable: true },
     },
     required: ["reply"],
@@ -500,7 +517,19 @@ function parseModelJson<T>(text: string | undefined): T {
     throw new Error("Model returned no JSON text.");
   }
 
-  return JSON.parse(text.trim()) as T;
+  const trimmed = text.trim();
+
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch (error) {
+    const repaired = trimmed.replace(/\\u(?![0-9a-fA-F]{4})/g, "\\\\u");
+
+    if (repaired !== trimmed) {
+      return JSON.parse(repaired) as T;
+    }
+
+    throw error;
+  }
 }
 
 function normalizeSteps(rawSteps: unknown): string[] {
@@ -515,6 +544,17 @@ function normalizeSteps(rawSteps: unknown): string[] {
     .slice(0, 4);
 
   return steps.length > 0 ? steps : ["Open the thing", "Do the smallest visible part"];
+}
+
+function fallbackStepsForTitle(title: string): string[] {
+  return [
+    `Gather what you need for ${title}.`,
+    `Do the smallest visible part of ${title} for five minutes.`,
+  ];
+}
+
+function userAskedForStepRewrite(message: string): boolean {
+  return /\b(todo|to-do|list|steps?|recipe|plan|breakdown)\b/i.test(message);
 }
 
 async function generateFreeform(prompt: string, systemInstruction: string): Promise<string> {
@@ -648,6 +688,61 @@ async function loadOwnedTask(userId: string, taskId: string) {
   return { task, steps, payload: taskPayload(task, steps) };
 }
 
+async function updateTaskDetails({
+  taskId,
+  title,
+  userId,
+  steps,
+}: {
+  taskId: string;
+  title?: string;
+  userId: string;
+  steps?: string[];
+}) {
+  await db.transaction(async (tx) => {
+    if (title) {
+      await tx
+        .update(tasks)
+        .set({ title })
+        .where(and(eq(tasks.id, taskId), eq(tasks.userId, userId)));
+    }
+
+    if (steps && steps.length > 0) {
+      await tx.delete(taskSteps).where(eq(taskSteps.taskId, taskId));
+      await tx.insert(taskSteps).values(
+        steps.map((step, position) => ({
+          taskId,
+          content: step,
+          position,
+        })),
+      );
+    }
+  });
+}
+
+function inferDirectFocusMutation(
+  message: string,
+): { title: string; steps: string[] | undefined } | null {
+  const match = message.match(/\b(?:change|switch|replace)\b.*?\b(?:to|with)\s+([^.!?]+)/i);
+  const target = match?.[1]
+    ?.replace(/\b(?:and|then)\b.*$/i, "")
+    .replace(/\b(?:the|a|an)\b\s+/i, "")
+    .trim();
+
+  if (!target) {
+    return null;
+  }
+
+  const title = /^(make|cook|prepare|do|write|send|call|clean)\b/i.test(target)
+    ? target.charAt(0).toUpperCase() + target.slice(1)
+    : `Make ${target}`;
+
+  return {
+    title,
+    steps: userAskedForStepRewrite(message) ? fallbackStepsForTitle(title) : undefined,
+  };
+}
+
 const app = new Hono();
 
 app.get("/healthz", (c) => {
@@ -679,7 +774,7 @@ app.get("/api/me", async (c) => {
 });
 
 app.post("/api/auth/demo", async (c) => {
-  const user = await getOrCreateDemoUser();
+  const user = await createDemoUser();
   setSessionCookie(c, user.id);
   return c.json({ user: publicUser(user) });
 });
@@ -698,10 +793,17 @@ app.post("/api/auth/google", async (c) => {
   }
 
   const oauthClient = new OAuth2Client(clientId);
-  const ticket = await oauthClient.verifyIdToken({
-    idToken: body.credential,
-    audience: clientId,
-  });
+  const ticket = await oauthClient
+    .verifyIdToken({
+      idToken: body.credential,
+      audience: clientId,
+    })
+    .catch(() => null);
+
+  if (!ticket) {
+    return c.json({ error: "Invalid Google credential." }, 401);
+  }
+
   const payload = ticket.getPayload();
   const email = payload?.email?.toLowerCase();
   const subject = payload?.sub;
@@ -751,6 +853,12 @@ app.post("/api/logout", (c) => {
 });
 
 app.post("/api/generate", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before generating with Gemini." }, 401);
+  }
+
   const body = await c.req.json<{ prompt?: unknown }>();
 
   if (typeof body.prompt !== "string" || body.prompt.trim().length === 0) {
@@ -904,6 +1012,18 @@ app.post("/api/reflect", async (c) => {
     return c.json({ error: "Reflection answers are required." }, 400);
   }
 
+  const reflectionPrompt = boundedJson(
+    {
+      answers: body.answers,
+      carryForward: typeof body.carryForward === "string" ? body.carryForward : "",
+    },
+    "Reflection payload",
+  );
+
+  if (reflectionPrompt instanceof Response) {
+    return reflectionPrompt;
+  }
+
   if (!hasUsableCredentials()) {
     return c.json({ error: "Gemini is not configured yet. Reflection needs a key." }, 503);
   }
@@ -912,10 +1032,7 @@ app.post("/api/reflect", async (c) => {
     const client = createClient();
     const response = await client.models.generateContent({
       model: modelName(),
-      contents: JSON.stringify({
-        answers: body.answers,
-        carryForward: typeof body.carryForward === "string" ? body.carryForward : "",
-      }),
+      contents: reflectionPrompt,
       config: {
         systemInstruction: [
           "You are Starflow's evening reflection guide for ADHD users.",
@@ -1039,9 +1156,21 @@ app.post("/api/events", async (c) => {
       ? body.modality
       : "text";
   const payload = typeof body.payload === "string" ? body.payload.trim() : "";
+  const payloadJson = boundedJson(body.payload ?? {}, "Event payload");
+
+  if (payloadJson instanceof Response) {
+    return payloadJson;
+  }
 
   if (!payload && eventType === "input_received") {
     return c.json({ error: "Input events need a text payload." }, 400);
+  }
+
+  if (payload.length > MAX_PROMPT_LENGTH) {
+    return c.json(
+      { error: `Event payload must be ${MAX_PROMPT_LENGTH} characters or fewer.` },
+      400,
+    );
   }
 
   if (!hasUsableCredentials()) {
@@ -1058,6 +1187,13 @@ app.post("/api/events", async (c) => {
     }
   }
 
+  if (eventType === "task_completed" && ownedTask) {
+    await db
+      .update(tasks)
+      .set({ status: "done" })
+      .where(and(eq(tasks.id, ownedTask.task.id), eq(tasks.userId, user.id)));
+  }
+
   const prompt = [
     "You are Starflow's event router orchestrator.",
     "Run an ADK-style multi-agent flow mentally: Sense Agent, Classifier Agent, Triage Agent, Coach Agent, Breakdown Agent.",
@@ -1070,7 +1206,7 @@ app.post("/api/events", async (c) => {
     ownedTask
       ? `Steps: ${ownedTask.payload.steps.map((step) => `${step.done ? "[x]" : "[ ]"} ${step.content}`).join("; ")}`
       : "Steps: none",
-    `Payload: ${payload || JSON.stringify(body.payload ?? {})}`,
+    `Payload: ${payload || payloadJson}`,
     "Return only the JSON requested by the schema. Keep it brief.",
   ].join("\n");
 
@@ -1142,11 +1278,18 @@ app.post("/api/chat", async (c) => {
     return c.json({ error: "Chat message is required." }, 400);
   }
 
-  if (!hasUsableCredentials()) {
-    return c.json({ error: "Gemini is not configured yet." }, 503);
+  const message = body.message.trim();
+
+  if (message.length > MAX_PROMPT_LENGTH) {
+    return c.json({ error: `Chat message must be ${MAX_PROMPT_LENGTH} characters or fewer.` }, 400);
   }
 
-  const message = body.message.trim();
+  const uiContextJson = boundedJson(body.uiContext ?? {}, "UI context");
+
+  if (uiContextJson instanceof Response) {
+    return uiContextJson;
+  }
+
   let ownedTask: Awaited<ReturnType<typeof loadOwnedTask>> | null = null;
 
   if (agent === "focus") {
@@ -1161,6 +1304,34 @@ app.post("/api/chat", async (c) => {
     }
   }
 
+  if (agent === "focus" && ownedTask) {
+    const directMutation = inferDirectFocusMutation(message);
+
+    if (directMutation) {
+      const update = {
+        taskId: ownedTask.task.id,
+        title: directMutation.title,
+        userId: user.id,
+        ...(directMutation.steps ? { steps: directMutation.steps } : {}),
+      };
+
+      await updateTaskDetails(update);
+      const reloaded = await loadOwnedTask(user.id, ownedTask.task.id);
+
+      return c.json({
+        reply: directMutation.steps
+          ? `Updated it to ${directMutation.title} and refreshed the steps.`
+          : `Updated it to ${directMutation.title}.`,
+        uiPatch: { taskUpdated: true },
+        task: reloaded?.payload ?? ownedTask.payload,
+      });
+    }
+  }
+
+  if (!hasUsableCredentials()) {
+    return c.json({ error: "Gemini is not configured yet." }, 503);
+  }
+
   const roleInstruction = {
     landing:
       "You are the Starflow landing-page concierge. Be elegant, brief, and invite the user toward the capture loop. You may suggest route='capture' when they want to try it.",
@@ -1169,7 +1340,7 @@ app.post("/api/chat", async (c) => {
     capture:
       "You are Record and Translate. Convert voice/image/text-like mess into clear user-owned words without prioritizing yet. If the user asks you to rewrite their dump, return capture_text with a gentler clearer version.",
     focus:
-      "You are Receiving Adjustments and Changing Tasks, with Breakdowner support. The user is working on the task below. Keep replies to 1-3 sentences. When they say it is too much, shrink the first incomplete step and return updated_first_step.",
+      "You are Receiving Adjustments and Changing Tasks, with Prioritization and Breakdown support. The user is working on the task below. If they explicitly ask to change, replace, rename, or adjust the task, return updated_task_title and/or updated_steps so the UI changes. If they say the next move is too much, shrink the first incomplete step and return updated_first_step. Keep replies to 1-3 sentences.",
     reflect:
       "You are Prioritizer for reflection. Help the user notice one meaningful signal from the day and choose what to carry tomorrow. Do not alter tasks.",
   }[agent];
@@ -1178,13 +1349,17 @@ app.post("/api/chat", async (c) => {
     "Return JSON matching the schema.",
     `Agent: ${agent}`,
     `Instruction: ${roleInstruction}`,
+    "Agent boundaries: Context normalizes available context; Task Extraction detects actionable tasks; Prioritization ranks selected active tasks; Breakdown rewrites executable subtasks. Do not invent unrelated work.",
+    "Mutation rule: when the user asks for a visible task/list change, return the matching update fields instead of only chatting about it.",
+    "If updated_task_title changes the task topic and the user asks to update the todo list, plan, recipe, or steps, updated_steps is required.",
+    "Example: if the active task is a recipe and the user says 'change it to pasta and update the todo list', return updated_task_title like 'Make pasta' plus updated_steps for pasta.",
     `User: ${user.displayName ?? user.email}`,
     ownedTask
       ? `Task: ${ownedTask.payload.title}\nWhy: ${ownedTask.payload.whyItMatters ?? "not set"}\nSteps:\n${ownedTask.payload.steps
           .map((step) => `${step.done ? "[x]" : "[ ]"} ${step.id}: ${step.content}`)
           .join("\n")}\nTone: ${ownedTask.payload.emotionalTone ?? "unknown"}`
       : "Task: none",
-    `UI context: ${JSON.stringify(body.uiContext ?? {})}`,
+    `UI context: ${uiContextJson}`,
     `User message: ${message}`,
   ].join("\n\n");
 
@@ -1199,13 +1374,15 @@ app.post("/api/chat", async (c) => {
         responseMimeType: "application/json",
         responseSchema: chatSchema(),
         temperature: 0.45,
-        maxOutputTokens: 450,
+        maxOutputTokens: 700,
       },
     });
     const parsed = parseModelJson<{
       reply?: string;
       capture_text?: string | null;
       updated_first_step?: string | null;
+      updated_task_title?: string | null;
+      updated_steps?: string[] | null;
       route?: string | null;
     }>(response.text);
     let updatedTask = ownedTask?.payload ?? null;
@@ -1220,7 +1397,7 @@ app.post("/api/chat", async (c) => {
     }
 
     if (agent === "focus" && parsed.updated_first_step && ownedTask) {
-      const target = ownedTask.steps.find((step) => !step.done) ?? ownedTask.steps[0];
+      const target = ownedTask.steps.find((step) => !step.done);
 
       if (target) {
         await db
@@ -1230,6 +1407,40 @@ app.post("/api/chat", async (c) => {
         const reloaded = await loadOwnedTask(user.id, ownedTask.task.id);
         updatedTask = reloaded?.payload ?? updatedTask;
         uiPatch.updatedStepId = target.id;
+      }
+    }
+
+    if (agent === "focus" && ownedTask) {
+      const updatedTitle = parsed.updated_task_title?.trim();
+      const updatedSteps = Array.isArray(parsed.updated_steps)
+        ? parsed.updated_steps
+            .filter((step): step is string => typeof step === "string")
+            .map((step) => step.trim())
+            .filter(Boolean)
+            .slice(0, 4)
+        : [];
+      const replacementSteps =
+        updatedSteps.length > 0
+          ? updatedSteps
+          : updatedTitle && userAskedForStepRewrite(message)
+            ? fallbackStepsForTitle(updatedTitle)
+            : [];
+      const shouldUpdateTitle = Boolean(updatedTitle);
+      const shouldReplaceSteps = replacementSteps.length > 0;
+
+      if (shouldUpdateTitle || shouldReplaceSteps) {
+        const update = {
+          taskId: ownedTask.task.id,
+          userId: user.id,
+          ...(updatedTitle ? { title: updatedTitle } : {}),
+          ...(shouldReplaceSteps ? { steps: replacementSteps } : {}),
+        };
+
+        await updateTaskDetails(update);
+
+        const reloaded = await loadOwnedTask(user.id, ownedTask.task.id);
+        updatedTask = reloaded?.payload ?? updatedTask;
+        uiPatch.taskUpdated = true;
       }
     }
 
@@ -1247,6 +1458,7 @@ app.post("/api/chat", async (c) => {
 app.get("*", async (c) => serveFrontend(new URL(c.req.url).pathname));
 
 const port = parsePort(process.env.PORT);
+sessionSecret();
 
 Bun.serve({
   hostname: "0.0.0.0",

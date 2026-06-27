@@ -26,11 +26,10 @@ We intentionally did not migrate to TanStack Start yet. TanStack Start is attrac
 
 Starflow's AI surface should be presented as an ADK-style multi-agent system:
 
-- Sense Agent: Gemini multimodal intake for voice/image/text.
-- Classifier Agent: labels the spark as creative, life-admin, emotional, recurring, urgent, or long-term.
-- Triage Agent: asks only the one or two relevant questions.
-- Coach Agents: Creative Coach, Life-Admin Coach, Emotional Reset Coach.
-- Breakdown Agent: creates tiny steps and chooses the one first step.
+- Context Agent: normalizes multimodal and tool context into structured context.
+- Task Extraction Agent: extracts candidate tasks into an inbox.
+- Prioritization Agent: prioritizes selected active tasks only.
+- Breakdown Agent: creates tiny executable subtasks.
 - Adjustment Agent: handles task edits, task completions, and "this feels too much" changes.
 
 User events flow through an event-router shape:
@@ -52,7 +51,7 @@ Each page also gets a scoped agent personality:
 
 - Landing/sign-in: guide only, no hidden state mutation.
 - Capture: Sense/Record and Translate; may patch the current dump text.
-- Focus: Adjustment Agent with Breakdowner support; may shrink/persist the first incomplete step.
+- Focus: Adjustment Agent with Prioritization and Breakdown support; may shrink/persist the first incomplete step, rename the active task, or replace its step list.
 - Reflect: Prioritizer for daily reflection; helps choose what carries forward.
 
 The mutation surface is intentionally narrow. Agents receive only the UI context for the active page and may only return allowed patches.

@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   brain_dump_id uuid REFERENCES brain_dumps(id) ON DELETE SET NULL,
   title text NOT NULL,
   why_it_matters text,
-  status text NOT NULL DEFAULT 'open',
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'done')),
   encouragement text,
   emotional_tone text,
   other_tasks jsonb NOT NULL DEFAULT '[]'::jsonb,
@@ -26,6 +26,18 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS tasks_user_status_created_idx
   ON tasks(user_id, status, created_at);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'tasks_status_check'
+  ) THEN
+    ALTER TABLE tasks
+      ADD CONSTRAINT tasks_status_check CHECK (status IN ('open', 'done'));
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS task_steps (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
