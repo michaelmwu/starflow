@@ -1,14 +1,20 @@
-import { GoogleGenAI } from "@google/genai";
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { GoogleGenAI, Type } from "@google/genai";
+import { and, count, desc, eq } from "drizzle-orm";
+import { OAuth2Client } from "google-auth-library";
+import { type Context, Hono } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { db } from "./db/client";
+import { appUsers, brainDumps, reflections, taskSteps, tasks } from "./db/schema";
 
 const DEFAULT_MODEL = "gemini-2.5-flash";
 const MAX_PROMPT_LENGTH = 8_000;
+const SESSION_COOKIE = "starflow_session";
+const DEMO_EMAIL = "demo@starflow.local";
 
-type GenerateRequest = {
-  prompt?: unknown;
-};
-
-type JsonBody = Record<string, unknown>;
 type ProviderMode = "gemini-enterprise-agent-platform" | "gemini-developer-api";
+type AgentRole = "landing" | "signin" | "capture" | "focus" | "reflect";
+type UserEventType = "input_received" | "task_edited" | "task_completed";
 
 type GeminiConfig = {
   provider: ProviderMode;
@@ -19,11 +25,28 @@ type GeminiConfig = {
   location: string;
 };
 
-const systemInstruction = [
-  "You are the AI backend for a Google Cloud hackathon webapp.",
-  "Give concise, practical, product-oriented answers.",
-  "When useful, structure the response as short sections or bullets.",
-].join(" ");
+type PublicUser = {
+  id: string;
+  email: string;
+  displayName: string | null;
+  isDemo: boolean;
+};
+
+type CurrentUser = PublicUser & {
+  googleSubject: string | null;
+};
+
+type TriageResult = {
+  main_quest?: {
+    title?: string;
+    why_it_matters?: string;
+  };
+  tiny_steps?: string[];
+  detected_deadlines?: Array<{ text?: string; when?: string | null }>;
+  other_tasks?: string[];
+  emotional_tone?: string;
+  encouragement?: string;
+};
 
 function envValue(name: string): string | undefined {
   const value = process.env[name]?.trim();
@@ -43,6 +66,10 @@ function developerApiKey(): string | undefined {
 }
 
 function enterpriseApiKey(): string | undefined {
+  if (envFlag("GOOGLE_GENAI_USE_ENTERPRISE")) {
+    return envValue("GOOGLE_AGENT_PLATFORM_KEY") ?? envValue("GOOGLE_API_KEY");
+  }
+
   return envValue("GOOGLE_AGENT_PLATFORM_KEY");
 }
 
@@ -69,7 +96,9 @@ function geminiConfig(): GeminiConfig {
     if (apiKey) {
       return {
         provider: "gemini-enterprise-agent-platform",
-        credentialSource: "GOOGLE_AGENT_PLATFORM_KEY",
+        credentialSource: envValue("GOOGLE_AGENT_PLATFORM_KEY")
+          ? "GOOGLE_AGENT_PLATFORM_KEY"
+          : "GOOGLE_API_KEY",
         apiKey,
         project,
         projectNumber,
@@ -104,39 +133,25 @@ function geminiConfig(): GeminiConfig {
 }
 
 function parsePort(rawPort: string | undefined): number {
-  const defaultPort = 3000;
-
   if (!rawPort || rawPort.trim().length === 0) {
-    return defaultPort;
+    return 3000;
   }
 
   const portCandidate = rawPort.trim();
 
   if (!/^\d+$/.test(portCandidate)) {
-    return defaultPort;
+    return 3000;
   }
 
   const parsedPort = Number(portCandidate);
-
-  if (!Number.isSafeInteger(parsedPort) || parsedPort < 1 || parsedPort > 65_535) {
-    return defaultPort;
-  }
-
-  return parsedPort;
+  return Number.isSafeInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65_535
+    ? parsedPort
+    : 3000;
 }
 
 function logServerError(message: string, error: unknown): void {
   // biome-ignore lint/suspicious/noConsole: Server-side diagnostics belong in Cloud Run logs.
   console.error(message, error);
-}
-
-function configuredProvider(): string {
-  return geminiConfig().provider;
-}
-
-function hasUsableCredentials(): boolean {
-  const config = geminiConfig();
-  return configHasUsableCredentials(config);
 }
 
 function configHasUsableCredentials(config: GeminiConfig): boolean {
@@ -145,6 +160,10 @@ function configHasUsableCredentials(config: GeminiConfig): boolean {
   }
 
   return Boolean(config.apiKey);
+}
+
+function hasUsableCredentials(): boolean {
+  return configHasUsableCredentials(geminiConfig());
 }
 
 function createClient(): GoogleGenAI {
@@ -180,35 +199,325 @@ function createClient(): GoogleGenAI {
   return new GoogleGenAI({ apiKey: config.apiKey });
 }
 
-function json(status: number, body: JsonBody): Response {
-  return Response.json(body, {
-    status,
-    headers: {
-      "Cache-Control": "no-store",
-    },
-  });
+function sessionSecret(): string {
+  return envValue("SESSION_SECRET") ?? "local-dev-insecure-starflow-session-secret";
 }
 
-function html(): Response {
-  return new Response(pageHtml, {
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store",
-    },
-  });
+function signValue(value: string): string {
+  return createHmac("sha256", sessionSecret()).update(value).digest("base64url");
 }
 
-async function parseJsonRequest(request: Request): Promise<GenerateRequest> {
-  const contentType = request.headers.get("content-type") ?? "";
+function signedSessionValue(userId: string): string {
+  return `${userId}.${signValue(userId)}`;
+}
 
-  if (!contentType.includes("application/json")) {
-    throw new Error("Expected application/json.");
+function verifySessionValue(raw: string | undefined): string | null {
+  if (!raw) {
+    return null;
   }
 
-  return (await request.json()) as GenerateRequest;
+  const [userId, signature] = raw.split(".");
+
+  if (!userId || !signature) {
+    return null;
+  }
+
+  const expected = signValue(userId);
+  const expectedBuffer = Buffer.from(expected);
+  const actualBuffer = Buffer.from(signature);
+
+  if (expectedBuffer.length !== actualBuffer.length) {
+    return null;
+  }
+
+  return timingSafeEqual(expectedBuffer, actualBuffer) ? userId : null;
 }
 
-async function generateText(prompt: string): Promise<string> {
+function isProduction(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+function publicUser(user: CurrentUser): PublicUser {
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.displayName,
+    isDemo: user.email === DEMO_EMAIL,
+  };
+}
+
+async function currentUserFromId(userId: string): Promise<CurrentUser | null> {
+  const [user] = await db
+    .select({
+      id: appUsers.id,
+      email: appUsers.email,
+      displayName: appUsers.displayName,
+      googleSubject: appUsers.googleSubject,
+    })
+    .from(appUsers)
+    .where(eq(appUsers.id, userId))
+    .limit(1);
+
+  if (!user) {
+    return null;
+  }
+
+  return { ...user, isDemo: user.email === DEMO_EMAIL };
+}
+
+async function getOrCreateDemoUser(): Promise<CurrentUser> {
+  await db
+    .insert(appUsers)
+    .values({
+      email: DEMO_EMAIL,
+      displayName: "Demo",
+    })
+    .onConflictDoNothing({ target: appUsers.email });
+
+  const user = await currentUserByEmail(DEMO_EMAIL);
+
+  if (!user) {
+    throw new Error("Demo user was not created.");
+  }
+
+  return user;
+}
+
+async function currentUserByEmail(email: string): Promise<CurrentUser | null> {
+  const [user] = await db
+    .select({
+      id: appUsers.id,
+      email: appUsers.email,
+      displayName: appUsers.displayName,
+      googleSubject: appUsers.googleSubject,
+    })
+    .from(appUsers)
+    .where(eq(appUsers.email, email))
+    .limit(1);
+
+  return user ? { ...user, isDemo: user.email === DEMO_EMAIL } : null;
+}
+
+function allowedEmails(): Set<string> | null {
+  const raw = envValue("ALLOWED_EMAILS");
+
+  if (!raw) {
+    return null;
+  }
+
+  return new Set(
+    raw
+      .split(",")
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+async function requireUser(c: Context) {
+  const userId = verifySessionValue(getCookie(c, SESSION_COOKIE));
+
+  if (!userId) {
+    return null;
+  }
+
+  return currentUserFromId(userId);
+}
+
+function setSessionCookie(c: Context, userId: string): void {
+  setCookie(c, SESSION_COOKIE, signedSessionValue(userId), {
+    httpOnly: true,
+    maxAge: 60 * 60 * 24 * 30,
+    path: "/",
+    sameSite: "Lax",
+    secure: isProduction(),
+  });
+}
+
+function clearSessionCookie(c: Context): void {
+  deleteCookie(c, SESSION_COOKIE, {
+    path: "/",
+    secure: isProduction(),
+  });
+}
+
+const staticRoot = new URL("../dist/client/", import.meta.url);
+
+const contentTypes = new Map<string, string>([
+  [".css", "text/css; charset=utf-8"],
+  [".html", "text/html; charset=utf-8"],
+  [".js", "text/javascript; charset=utf-8"],
+  [".json", "application/json; charset=utf-8"],
+  [".map", "application/json; charset=utf-8"],
+  [".png", "image/png"],
+  [".svg", "image/svg+xml"],
+  [".webp", "image/webp"],
+]);
+
+function contentTypeFor(pathname: string): string {
+  const extension = pathname.match(/\.[^.]*$/)?.[0] ?? ".html";
+  return contentTypes.get(extension) ?? "application/octet-stream";
+}
+
+async function serveFrontend(pathname: string): Promise<Response> {
+  const safePathname = decodeURIComponent(pathname);
+
+  if (safePathname.includes("..")) {
+    return Response.json({ error: "Invalid path." }, { status: 400 });
+  }
+
+  const assetPath = safePathname === "/" ? "/index.html" : safePathname;
+  const assetFile = Bun.file(new URL(`.${assetPath}`, staticRoot));
+
+  if (await assetFile.exists()) {
+    return new Response(assetFile, {
+      headers: {
+        "Cache-Control":
+          assetPath === "/index.html" ? "no-store" : "public, max-age=31536000, immutable",
+        "Content-Type": contentTypeFor(assetPath),
+      },
+    });
+  }
+
+  const indexFile = Bun.file(new URL("./index.html", staticRoot));
+
+  if (await indexFile.exists()) {
+    return new Response(indexFile, {
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+  }
+
+  return new Response(
+    "Starflow frontend is not built yet. Run `bun run dev:local` for Vite dev mode, or `bun run build` before `bun run start`.",
+    {
+      status: 503,
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "text/plain; charset=utf-8",
+      },
+    },
+  );
+}
+
+function triageSchema() {
+  return {
+    type: Type.OBJECT,
+    properties: {
+      main_quest: {
+        type: Type.OBJECT,
+        properties: {
+          title: { type: Type.STRING },
+          why_it_matters: { type: Type.STRING },
+        },
+        required: ["title"],
+      },
+      tiny_steps: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+      },
+      detected_deadlines: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            text: { type: Type.STRING },
+            when: { type: Type.STRING, nullable: true },
+          },
+        },
+      },
+      other_tasks: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+      },
+      emotional_tone: { type: Type.STRING },
+      encouragement: { type: Type.STRING },
+    },
+    required: ["main_quest", "tiny_steps", "emotional_tone", "encouragement"],
+  };
+}
+
+function chatSchema() {
+  return {
+    type: Type.OBJECT,
+    properties: {
+      reply: { type: Type.STRING },
+      capture_text: { type: Type.STRING, nullable: true },
+      updated_first_step: { type: Type.STRING, nullable: true },
+      route: { type: Type.STRING, nullable: true },
+    },
+    required: ["reply"],
+  };
+}
+
+function reflectionSchema() {
+  return {
+    type: Type.OBJECT,
+    properties: {
+      summary: { type: Type.STRING },
+      pattern: { type: Type.STRING },
+      small_win: { type: Type.STRING },
+      tomorrow_experiment: { type: Type.STRING },
+    },
+    required: ["summary", "pattern", "small_win", "tomorrow_experiment"],
+  };
+}
+
+function eventRouterSchema() {
+  return {
+    type: Type.OBJECT,
+    properties: {
+      sensed_spark: { type: Type.STRING },
+      spark_type: { type: Type.STRING },
+      triage_question: { type: Type.STRING },
+      coach_persona: { type: Type.STRING },
+      one_first_step: { type: Type.STRING },
+      tiny_steps: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+      },
+      priority_reason: { type: Type.STRING },
+      suggested_tool_action: { type: Type.STRING },
+      dashboard_note: { type: Type.STRING },
+    },
+    required: [
+      "sensed_spark",
+      "spark_type",
+      "triage_question",
+      "coach_persona",
+      "one_first_step",
+      "tiny_steps",
+      "priority_reason",
+      "suggested_tool_action",
+      "dashboard_note",
+    ],
+  };
+}
+
+function parseModelJson<T>(text: string | undefined): T {
+  if (!text) {
+    throw new Error("Model returned no JSON text.");
+  }
+
+  return JSON.parse(text.trim()) as T;
+}
+
+function normalizeSteps(rawSteps: unknown): string[] {
+  if (!Array.isArray(rawSteps)) {
+    return ["Open the thing", "Do the smallest visible part"];
+  }
+
+  const steps = rawSteps
+    .filter((step): step is string => typeof step === "string")
+    .map((step) => step.trim())
+    .filter(Boolean)
+    .slice(0, 4);
+
+  return steps.length > 0 ? steps : ["Open the thing", "Do the smallest visible part"];
+}
+
+async function generateFreeform(prompt: string, systemInstruction: string): Promise<string> {
   const client = createClient();
   const response = await client.models.generateContent({
     model: modelName(),
@@ -216,514 +525,738 @@ async function generateText(prompt: string): Promise<string> {
     config: {
       systemInstruction,
       temperature: 0.4,
-      maxOutputTokens: 1_200,
+      maxOutputTokens: 1_000,
     },
   });
 
   return response.text ?? "No text was returned by the model.";
 }
 
-async function handleGenerate(request: Request): Promise<Response> {
-  let body: GenerateRequest;
+async function generateTriage(text: string): Promise<TriageResult> {
+  const client = createClient();
+  const response = await client.models.generateContent({
+    model: modelName(),
+    contents: text,
+    config: {
+      systemInstruction: [
+        "You help an ADHD person who just brain-dumped.",
+        "From their mess, pick the SINGLE most relieving thing to focus on right now, not necessarily the most important.",
+        "Break it into tiny steps where the first is doable in two minutes.",
+        "Be warm and brief. Never lecture. Never produce a long list. Never tell them to just do something.",
+      ].join(" "),
+      responseMimeType: "application/json",
+      responseSchema: triageSchema(),
+      temperature: 0.5,
+      maxOutputTokens: 900,
+    },
+  });
 
-  try {
-    body = await parseJsonRequest(request);
-  } catch (error) {
-    return json(400, { error: error instanceof Error ? error.message : "Invalid JSON request." });
+  return parseModelJson<TriageResult>(response.text);
+}
+
+function taskPayload(
+  task: typeof tasks.$inferSelect,
+  steps: Array<typeof taskSteps.$inferSelect>,
+): {
+  id: string;
+  title: string;
+  whyItMatters: string | null;
+  encouragement: string | null;
+  emotionalTone: string | null;
+  otherTasks: string[];
+  steps: Array<{ id: string; content: string; done: boolean; position: number }>;
+} {
+  return {
+    id: task.id,
+    title: task.title,
+    whyItMatters: task.whyItMatters,
+    encouragement: task.encouragement,
+    emotionalTone: task.emotionalTone,
+    otherTasks: Array.isArray(task.otherTasks) ? (task.otherTasks as string[]) : [],
+    steps: steps.map((step) => ({
+      id: step.id,
+      content: step.content,
+      done: step.done,
+      position: step.position,
+    })),
+  };
+}
+
+async function loadOpenTask(userId: string) {
+  const [task] = await db
+    .select()
+    .from(tasks)
+    .where(and(eq(tasks.userId, userId), eq(tasks.status, "open")))
+    .orderBy(desc(tasks.createdAt))
+    .limit(1);
+
+  if (!task) {
+    return null;
   }
 
+  const steps = await db
+    .select()
+    .from(taskSteps)
+    .where(eq(taskSteps.taskId, task.id))
+    .orderBy(taskSteps.position);
+
+  return taskPayload(task, steps);
+}
+
+async function loadReflectionState(userId: string) {
+  const [total] = await db
+    .select({ value: count() })
+    .from(reflections)
+    .where(eq(reflections.userId, userId));
+  const [latest] = await db
+    .select()
+    .from(reflections)
+    .where(eq(reflections.userId, userId))
+    .orderBy(desc(reflections.createdAt))
+    .limit(1);
+
+  return {
+    count: total?.value ?? 0,
+    latest: latest
+      ? {
+          id: latest.id,
+          summary: latest.summary,
+          carryForward: latest.carryForward,
+          createdAt: latest.createdAt.toISOString(),
+        }
+      : null,
+  };
+}
+
+async function loadOwnedTask(userId: string, taskId: string) {
+  const [task] = await db
+    .select()
+    .from(tasks)
+    .where(and(eq(tasks.userId, userId), eq(tasks.id, taskId)))
+    .limit(1);
+
+  if (!task) {
+    return null;
+  }
+
+  const steps = await db
+    .select()
+    .from(taskSteps)
+    .where(eq(taskSteps.taskId, task.id))
+    .orderBy(taskSteps.position);
+
+  return { task, steps, payload: taskPayload(task, steps) };
+}
+
+const app = new Hono();
+
+app.get("/healthz", (c) => {
+  const config = geminiConfig();
+  const geminiConfigured = configHasUsableCredentials(config);
+
+  return c.json({
+    ok: true,
+    provider: config.provider,
+    credentialSource: geminiConfigured ? config.credentialSource : "not-configured",
+    geminiConfigured,
+    cloudProjectConfigured: Boolean(config.project),
+    projectNumberConfigured: Boolean(config.projectNumber),
+    location: config.location,
+  });
+});
+
+app.get("/api/config", (c) =>
+  c.json({
+    googleOAuthClientId: envValue("GOOGLE_OAUTH_CLIENT_ID") ?? null,
+    geminiConfigured: hasUsableCredentials(),
+    model: modelName(),
+  }),
+);
+
+app.get("/api/me", async (c) => {
+  const user = await requireUser(c);
+  return c.json({ user: user ? publicUser(user) : null });
+});
+
+app.post("/api/auth/demo", async (c) => {
+  const user = await getOrCreateDemoUser();
+  setSessionCookie(c, user.id);
+  return c.json({ user: publicUser(user) });
+});
+
+app.post("/api/auth/google", async (c) => {
+  const clientId = envValue("GOOGLE_OAUTH_CLIENT_ID");
+
+  if (!clientId) {
+    return c.json({ error: "Google sign-in is not configured." }, 503);
+  }
+
+  const body = await c.req.json<{ credential?: unknown }>();
+
+  if (typeof body.credential !== "string" || body.credential.trim().length === 0) {
+    return c.json({ error: "Google credential is required." }, 400);
+  }
+
+  const oauthClient = new OAuth2Client(clientId);
+  const ticket = await oauthClient.verifyIdToken({
+    idToken: body.credential,
+    audience: clientId,
+  });
+  const payload = ticket.getPayload();
+  const email = payload?.email?.toLowerCase();
+  const subject = payload?.sub;
+
+  if (!subject || !email || !payload.email_verified) {
+    return c.json({ error: "Google account email could not be verified." }, 401);
+  }
+
+  const allowlist = allowedEmails();
+
+  if (allowlist && !allowlist.has(email)) {
+    return c.json({ error: "This Google account is not on the Starflow test-user list." }, 403);
+  }
+
+  const [user] = await db
+    .insert(appUsers)
+    .values({
+      googleSubject: subject,
+      email,
+      displayName: payload.name ?? email,
+    })
+    .onConflictDoUpdate({
+      target: appUsers.googleSubject,
+      set: {
+        email,
+        displayName: payload.name ?? email,
+      },
+    })
+    .returning({
+      id: appUsers.id,
+      email: appUsers.email,
+      displayName: appUsers.displayName,
+      googleSubject: appUsers.googleSubject,
+    });
+
+  if (!user) {
+    throw new Error("Google user upsert did not return a row.");
+  }
+
+  setSessionCookie(c, user.id);
+  return c.json({ user: publicUser({ ...user, isDemo: false }) });
+});
+
+app.post("/api/logout", (c) => {
+  clearSessionCookie(c);
+  return c.json({ ok: true });
+});
+
+app.post("/api/generate", async (c) => {
+  const body = await c.req.json<{ prompt?: unknown }>();
+
   if (typeof body.prompt !== "string" || body.prompt.trim().length === 0) {
-    return json(400, { error: "Prompt is required." });
+    return c.json({ error: "Prompt is required." }, 400);
   }
 
   const prompt = body.prompt.trim();
 
   if (prompt.length > MAX_PROMPT_LENGTH) {
-    return json(400, { error: `Prompt must be ${MAX_PROMPT_LENGTH} characters or fewer.` });
+    return c.json({ error: `Prompt must be ${MAX_PROMPT_LENGTH} characters or fewer.` }, 400);
   }
 
   if (!hasUsableCredentials()) {
-    return json(503, {
-      error:
-        "Gemini is not configured. Set GEMINI_API_KEY for Developer API mode, or GOOGLE_AGENT_PLATFORM_KEY / GOOGLE_CLOUD_PROJECT for Agent Platform mode.",
-    });
+    return c.json(
+      {
+        error:
+          "Gemini is not configured. Set GEMINI_API_KEY for Developer API mode, or GOOGLE_AGENT_PLATFORM_KEY / GOOGLE_CLOUD_PROJECT for Agent Platform mode.",
+      },
+      503,
+    );
   }
 
   try {
-    const text = await generateText(prompt);
-    return json(200, {
-      text,
-      model: modelName(),
-      provider: configuredProvider(),
-    });
+    const text = await generateFreeform(
+      prompt,
+      [
+        "You are Starflow, a gentle but practical AI support layer for ADHD minds.",
+        "Help users turn scattered thoughts into one concrete next move without judgment.",
+      ].join(" "),
+    );
+    return c.json({ text, model: modelName(), provider: geminiConfig().provider });
   } catch (error) {
     logServerError("Gemini request failed.", error);
-    return json(502, {
-      error: "Gemini request failed. Check the server logs for details.",
+    return c.json({ error: "Gemini request failed. Check the server logs for details." }, 502);
+  }
+});
+
+app.post("/api/triage", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before triaging a brain dump." }, 401);
+  }
+
+  const body = await c.req.json<{ text?: unknown }>();
+
+  if (typeof body.text !== "string" || body.text.trim().length === 0) {
+    return c.json({ error: "Brain dump text is required." }, 400);
+  }
+
+  const text = body.text.trim();
+
+  if (text.length > MAX_PROMPT_LENGTH) {
+    return c.json({ error: `Brain dump must be ${MAX_PROMPT_LENGTH} characters or fewer.` }, 400);
+  }
+
+  if (!hasUsableCredentials()) {
+    return c.json(
+      { error: "Gemini is not configured yet. Demo sign-in works, but triage needs a key." },
+      503,
+    );
+  }
+
+  try {
+    const extracted = await generateTriage(text);
+    const tinySteps = normalizeSteps(extracted.tiny_steps);
+    const title = extracted.main_quest?.title?.trim() || "Choose the next small move";
+    const whyItMatters = extracted.main_quest?.why_it_matters?.trim() || null;
+    const otherTasks = Array.isArray(extracted.other_tasks) ? extracted.other_tasks : [];
+
+    const payload = await db.transaction(async (tx) => {
+      const [dump] = await tx
+        .insert(brainDumps)
+        .values({
+          userId: user.id,
+          rawText: text,
+          extracted,
+          emotionalTone: extracted.emotional_tone ?? null,
+        })
+        .returning({ id: brainDumps.id });
+
+      if (!dump) {
+        throw new Error("Brain dump insert did not return a row.");
+      }
+
+      const [task] = await tx
+        .insert(tasks)
+        .values({
+          userId: user.id,
+          brainDumpId: dump.id,
+          title,
+          whyItMatters,
+          encouragement: extracted.encouragement ?? null,
+          emotionalTone: extracted.emotional_tone ?? null,
+          otherTasks,
+        })
+        .returning();
+
+      if (!task) {
+        throw new Error("Task insert did not return a row.");
+      }
+
+      const insertedSteps = await tx
+        .insert(taskSteps)
+        .values(
+          tinySteps.map((step, position) => ({
+            taskId: task.id,
+            content: step,
+            position,
+          })),
+        )
+        .returning();
+
+      return taskPayload(task, insertedSteps);
     });
+
+    return c.json({ task: payload });
+  } catch (error) {
+    logServerError("Triage failed.", error);
+    return c.json({ error: "Starflow could not untangle that dump. Try a shorter version." }, 502);
   }
-}
+});
 
-function handleRequest(request: Request): Promise<Response> | Response {
-  const url = new URL(request.url);
+app.get("/api/state", async (c) => {
+  const user = await requireUser(c);
 
-  if (request.method === "GET" && url.pathname === "/") {
-    return html();
+  if (!user) {
+    return c.json({ error: "Sign in before loading Starflow state." }, 401);
   }
 
-  if (request.method === "GET" && url.pathname === "/healthz") {
-    const config = geminiConfig();
-    const geminiConfigured = configHasUsableCredentials(config);
+  const [task, reflection] = await Promise.all([
+    loadOpenTask(user.id),
+    loadReflectionState(user.id),
+  ]);
+  return c.json({ task, reflection });
+});
 
-    return json(200, {
-      ok: true,
-      provider: config.provider,
-      credentialSource: geminiConfigured ? config.credentialSource : "not-configured",
-      geminiConfigured,
-      cloudProjectConfigured: Boolean(config.project),
-      projectNumberConfigured: Boolean(config.projectNumber),
-      location: config.location,
+app.post("/api/reflect", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before saving a reflection." }, 401);
+  }
+
+  const body = await c.req.json<{
+    answers?: unknown;
+    carryForward?: unknown;
+  }>();
+
+  if (!body.answers || typeof body.answers !== "object") {
+    return c.json({ error: "Reflection answers are required." }, 400);
+  }
+
+  if (!hasUsableCredentials()) {
+    return c.json({ error: "Gemini is not configured yet. Reflection needs a key." }, 503);
+  }
+
+  try {
+    const client = createClient();
+    const response = await client.models.generateContent({
+      model: modelName(),
+      contents: JSON.stringify({
+        answers: body.answers,
+        carryForward: typeof body.carryForward === "string" ? body.carryForward : "",
+      }),
+      config: {
+        systemInstruction: [
+          "You are Starflow's evening reflection guide for ADHD users.",
+          "Summarize without judgment. Name one pattern, one small win, and one experiment for tomorrow.",
+          "Keep the summary warm and brief. Do not diagnose.",
+        ].join(" "),
+        responseMimeType: "application/json",
+        responseSchema: reflectionSchema(),
+        temperature: 0.45,
+        maxOutputTokens: 500,
+      },
     });
+    const parsed = parseModelJson<{
+      summary?: string;
+      pattern?: string;
+      small_win?: string;
+      tomorrow_experiment?: string;
+    }>(response.text);
+    const summary = [
+      parsed.summary,
+      parsed.pattern ? `Pattern: ${parsed.pattern}` : null,
+      parsed.small_win ? `Small win: ${parsed.small_win}` : null,
+      parsed.tomorrow_experiment ? `Tomorrow: ${parsed.tomorrow_experiment}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const [reflection] = await db
+      .insert(reflections)
+      .values({
+        userId: user.id,
+        answers: body.answers,
+        carryForward: typeof body.carryForward === "string" ? body.carryForward : null,
+        summary,
+      })
+      .returning();
+
+    if (!reflection) {
+      throw new Error("Reflection insert did not return a row.");
+    }
+
+    return c.json({
+      reflection: {
+        id: reflection.id,
+        summary: reflection.summary,
+        carryForward: reflection.carryForward,
+        createdAt: reflection.createdAt.toISOString(),
+      },
+    });
+  } catch (error) {
+    logServerError("Reflection failed.", error);
+    return c.json({ error: "Starflow could not gather that reflection. Try again briefly." }, 502);
+  }
+});
+
+app.patch("/api/steps/:id", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before updating a step." }, 401);
   }
 
-  if (request.method === "POST" && url.pathname === "/api/generate") {
-    return handleGenerate(request);
+  const body = await c.req.json<{ done?: unknown }>();
+
+  if (typeof body.done !== "boolean") {
+    return c.json({ error: "done must be a boolean." }, 400);
   }
 
-  return json(404, { error: "Not found." });
-}
+  const stepId = c.req.param("id");
+  const [owned] = await db
+    .select({ stepId: taskSteps.id })
+    .from(taskSteps)
+    .innerJoin(tasks, eq(taskSteps.taskId, tasks.id))
+    .where(and(eq(taskSteps.id, stepId), eq(tasks.userId, user.id)))
+    .limit(1);
+
+  if (!owned) {
+    return c.json({ error: "Step not found." }, 404);
+  }
+
+  const [step] = await db
+    .update(taskSteps)
+    .set({ done: body.done })
+    .where(eq(taskSteps.id, stepId))
+    .returning();
+
+  if (!step) {
+    return c.json({ error: "Step not found." }, 404);
+  }
+
+  return c.json({
+    step: {
+      id: step.id,
+      content: step.content,
+      done: step.done,
+      position: step.position,
+    },
+  });
+});
+
+app.post("/api/events", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before routing an event." }, 401);
+  }
+
+  const body = await c.req.json<{
+    type?: unknown;
+    modality?: unknown;
+    payload?: unknown;
+    taskId?: unknown;
+  }>();
+  const eventType = typeof body.type === "string" ? (body.type as UserEventType) : null;
+
+  if (!eventType || !["input_received", "task_edited", "task_completed"].includes(eventType)) {
+    return c.json({ error: "Unknown event type." }, 400);
+  }
+
+  const modality =
+    typeof body.modality === "string" && ["voice", "image", "text"].includes(body.modality)
+      ? body.modality
+      : "text";
+  const payload = typeof body.payload === "string" ? body.payload.trim() : "";
+
+  if (!payload && eventType === "input_received") {
+    return c.json({ error: "Input events need a text payload." }, 400);
+  }
+
+  if (!hasUsableCredentials()) {
+    return c.json({ error: "Gemini is not configured yet." }, 503);
+  }
+
+  let ownedTask: Awaited<ReturnType<typeof loadOwnedTask>> | null = null;
+
+  if (typeof body.taskId === "string") {
+    ownedTask = await loadOwnedTask(user.id, body.taskId);
+
+    if (!ownedTask) {
+      return c.json({ error: "Task not found." }, 404);
+    }
+  }
+
+  const prompt = [
+    "You are Starflow's event router orchestrator.",
+    "Run an ADK-style multi-agent flow mentally: Sense Agent, Classifier Agent, Triage Agent, Coach Agent, Breakdown Agent.",
+    "Sense Agent normalizes voice/image/text into a spark. Classifier labels it creative, life-admin, emotional, recurring, urgent, or long-term.",
+    "Triage Agent asks only one gentle question if needed. Coach Agent persona is Creative Coach, Life-Admin Coach, or Emotional Reset Coach.",
+    "Breakdown Agent returns tiny steps and chooses exactly one first step.",
+    `Event type: ${eventType}`,
+    `Input modality: ${modality}`,
+    ownedTask ? `Active task: ${ownedTask.payload.title}` : "Active task: none",
+    ownedTask
+      ? `Steps: ${ownedTask.payload.steps.map((step) => `${step.done ? "[x]" : "[ ]"} ${step.content}`).join("; ")}`
+      : "Steps: none",
+    `Payload: ${payload || JSON.stringify(body.payload ?? {})}`,
+    "Return only the JSON requested by the schema. Keep it brief.",
+  ].join("\n");
+
+  try {
+    const client = createClient();
+    const response = await client.models.generateContent({
+      model: modelName(),
+      contents: prompt,
+      config: {
+        systemInstruction:
+          "You orchestrate user events into task-store updates for an ADHD support app. Prefer one clear dashboard note, one first step, and tiny steps. suggested_tool_action must be one of: none, stitch, google_tasks, google_calendar.",
+        responseMimeType: "application/json",
+        responseSchema: eventRouterSchema(),
+        temperature: 0.4,
+        maxOutputTokens: 500,
+      },
+    });
+    const routed = parseModelJson<{
+      sensed_spark?: string;
+      spark_type?: string;
+      triage_question?: string;
+      coach_persona?: string;
+      one_first_step?: string;
+      tiny_steps?: string[];
+      priority_reason?: string | null;
+      suggested_tool_action?: string;
+      dashboard_note?: string;
+    }>(response.text);
+
+    return c.json({
+      routed: {
+        sensedSpark: routed.sensed_spark ?? payload,
+        sparkType: routed.spark_type ?? "creative",
+        triageQuestion: routed.triage_question ?? "What would make this feel lighter right now?",
+        coachPersona: routed.coach_persona ?? "Creative Coach",
+        oneFirstStep: routed.one_first_step ?? "Write one sentence about the outcome.",
+        priorityReason: routed.priority_reason ?? null,
+        tinySteps: normalizeSteps(routed.tiny_steps),
+        suggestedToolAction: routed.suggested_tool_action ?? "none",
+        dashboardNote: routed.dashboard_note ?? "Event received.",
+      },
+    });
+  } catch (error) {
+    logServerError("Event routing failed.", error);
+    return c.json({ error: "Starflow could not route that event." }, 502);
+  }
+});
+
+app.post("/api/chat", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before chatting with Starflow." }, 401);
+  }
+
+  const body = await c.req.json<{
+    agent?: unknown;
+    message?: unknown;
+    taskId?: unknown;
+    uiContext?: unknown;
+  }>();
+  const agent = typeof body.agent === "string" ? (body.agent as AgentRole) : "focus";
+
+  if (!["landing", "signin", "capture", "focus", "reflect"].includes(agent)) {
+    return c.json({ error: "Unknown chat agent." }, 400);
+  }
+
+  if (typeof body.message !== "string" || body.message.trim().length === 0) {
+    return c.json({ error: "Chat message is required." }, 400);
+  }
+
+  if (!hasUsableCredentials()) {
+    return c.json({ error: "Gemini is not configured yet." }, 503);
+  }
+
+  const message = body.message.trim();
+  let ownedTask: Awaited<ReturnType<typeof loadOwnedTask>> | null = null;
+
+  if (agent === "focus") {
+    if (typeof body.taskId !== "string") {
+      return c.json({ error: "Focus chat needs a taskId." }, 400);
+    }
+
+    ownedTask = await loadOwnedTask(user.id, body.taskId);
+
+    if (!ownedTask) {
+      return c.json({ error: "Task not found." }, 404);
+    }
+  }
+
+  const roleInstruction = {
+    landing:
+      "You are the Starflow landing-page concierge. Be elegant, brief, and invite the user toward the capture loop. You may suggest route='capture' when they want to try it.",
+    signin:
+      "You are the Starflow sign-in guide. Be calm and practical. Explain demo mode vs Google sign-in in one or two sentences. Never pretend to authenticate the user.",
+    capture:
+      "You are Record and Translate. Convert voice/image/text-like mess into clear user-owned words without prioritizing yet. If the user asks you to rewrite their dump, return capture_text with a gentler clearer version.",
+    focus:
+      "You are Receiving Adjustments and Changing Tasks, with Breakdowner support. The user is working on the task below. Keep replies to 1-3 sentences. When they say it is too much, shrink the first incomplete step and return updated_first_step.",
+    reflect:
+      "You are Prioritizer for reflection. Help the user notice one meaningful signal from the day and choose what to carry tomorrow. Do not alter tasks.",
+  }[agent];
+
+  const prompt = [
+    "Return JSON matching the schema.",
+    `Agent: ${agent}`,
+    `Instruction: ${roleInstruction}`,
+    `User: ${user.displayName ?? user.email}`,
+    ownedTask
+      ? `Task: ${ownedTask.payload.title}\nWhy: ${ownedTask.payload.whyItMatters ?? "not set"}\nSteps:\n${ownedTask.payload.steps
+          .map((step) => `${step.done ? "[x]" : "[ ]"} ${step.id}: ${step.content}`)
+          .join("\n")}\nTone: ${ownedTask.payload.emotionalTone ?? "unknown"}`
+      : "Task: none",
+    `UI context: ${JSON.stringify(body.uiContext ?? {})}`,
+    `User message: ${message}`,
+  ].join("\n\n");
+
+  try {
+    const client = createClient();
+    const response = await client.models.generateContent({
+      model: modelName(),
+      contents: prompt,
+      config: {
+        systemInstruction:
+          "You are a Starflow page-specific agent. Respect the page role and only return allowed UI patches. Be brief and do not invent hidden state.",
+        responseMimeType: "application/json",
+        responseSchema: chatSchema(),
+        temperature: 0.45,
+        maxOutputTokens: 450,
+      },
+    });
+    const parsed = parseModelJson<{
+      reply?: string;
+      capture_text?: string | null;
+      updated_first_step?: string | null;
+      route?: string | null;
+    }>(response.text);
+    let updatedTask = ownedTask?.payload ?? null;
+    const uiPatch: Record<string, unknown> = {};
+
+    if (agent === "capture" && parsed.capture_text) {
+      uiPatch.captureText = parsed.capture_text;
+    }
+
+    if (agent === "landing" && parsed.route === "capture") {
+      uiPatch.route = "capture";
+    }
+
+    if (agent === "focus" && parsed.updated_first_step && ownedTask) {
+      const target = ownedTask.steps.find((step) => !step.done) ?? ownedTask.steps[0];
+
+      if (target) {
+        await db
+          .update(taskSteps)
+          .set({ content: parsed.updated_first_step })
+          .where(eq(taskSteps.id, target.id));
+        const reloaded = await loadOwnedTask(user.id, ownedTask.task.id);
+        updatedTask = reloaded?.payload ?? updatedTask;
+        uiPatch.updatedStepId = target.id;
+      }
+    }
+
+    return c.json({
+      reply: parsed.reply ?? "I can help shrink the next move.",
+      uiPatch,
+      task: updatedTask,
+    });
+  } catch (error) {
+    logServerError("Chat failed.", error);
+    return c.json({ error: "Starflow chat could not answer. Try again in a sentence." }, 502);
+  }
+});
+
+app.get("*", async (c) => serveFrontend(new URL(c.req.url).pathname));
 
 const port = parsePort(process.env.PORT);
 
 Bun.serve({
   hostname: "0.0.0.0",
   port,
-  fetch: handleRequest,
+  fetch: app.fetch,
 });
 
 const startupConfig = geminiConfig();
 
 // biome-ignore lint/suspicious/noConsole: Startup logging is useful in Cloud Run logs.
 console.log(
-  `Saskatoon webapp listening on http://0.0.0.0:${port} (${startupConfig.provider}, ${startupConfig.credentialSource})`,
+  `Starflow API listening on http://0.0.0.0:${port} (${startupConfig.provider}, ${startupConfig.credentialSource})`,
 );
-
-const pageHtml = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Saskatoon AI</title>
-    <style>
-      :root {
-        color-scheme: light;
-        --bg: #f7f4ee;
-        --ink: #181816;
-        --muted: #68655f;
-        --line: #d8d2c5;
-        --panel: #fffdf8;
-        --accent: #0f7a65;
-        --accent-ink: #ffffff;
-        --warn: #9b5a14;
-        --shadow: 0 18px 44px rgba(37, 34, 28, 0.12);
-      }
-
-      * {
-        box-sizing: border-box;
-      }
-
-      body {
-        margin: 0;
-        min-height: 100vh;
-        background: var(--bg);
-        color: var(--ink);
-        font-family:
-          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      }
-
-      button,
-      textarea {
-        font: inherit;
-      }
-
-      .shell {
-        width: min(1120px, calc(100vw - 32px));
-        margin: 0 auto;
-        padding: 28px 0;
-      }
-
-      header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 20px;
-        min-height: 56px;
-      }
-
-      .brand {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        font-weight: 760;
-        letter-spacing: 0;
-      }
-
-      .mark {
-        display: grid;
-        width: 36px;
-        height: 36px;
-        place-items: center;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        background: #ffffff;
-        color: var(--accent);
-        font-weight: 900;
-      }
-
-      .status {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        color: var(--muted);
-        font-size: 14px;
-      }
-
-      .dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 99px;
-        background: var(--warn);
-      }
-
-      main {
-        display: grid;
-        grid-template-columns: minmax(0, 0.92fr) minmax(360px, 1.08fr);
-        gap: 28px;
-        align-items: stretch;
-        padding: 40px 0 0;
-      }
-
-      .intro {
-        display: flex;
-        min-height: 560px;
-        flex-direction: column;
-        justify-content: space-between;
-        padding: 8px 0 18px;
-      }
-
-      h1 {
-        max-width: 680px;
-        margin: 0;
-        font-size: clamp(42px, 6vw, 76px);
-        line-height: 0.96;
-        letter-spacing: 0;
-      }
-
-      .lede {
-        max-width: 560px;
-        margin: 24px 0 0;
-        color: var(--muted);
-        font-size: 18px;
-        line-height: 1.6;
-      }
-
-      .facts {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 12px;
-        max-width: 620px;
-      }
-
-      .fact {
-        border-top: 1px solid var(--line);
-        padding-top: 14px;
-      }
-
-      .fact strong {
-        display: block;
-        font-size: 15px;
-      }
-
-      .fact span {
-        display: block;
-        margin-top: 6px;
-        color: var(--muted);
-        font-size: 13px;
-        line-height: 1.4;
-      }
-
-      .workspace {
-        display: flex;
-        min-height: 560px;
-        flex-direction: column;
-        gap: 14px;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        background: var(--panel);
-        box-shadow: var(--shadow);
-        padding: 16px;
-      }
-
-      .toolbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        min-height: 36px;
-      }
-
-      .toolbar h2 {
-        margin: 0;
-        font-size: 15px;
-        letter-spacing: 0;
-      }
-
-      .model {
-        color: var(--muted);
-        font-size: 13px;
-      }
-
-      textarea {
-        width: 100%;
-        min-height: 168px;
-        resize: vertical;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        background: #ffffff;
-        color: var(--ink);
-        padding: 14px;
-        line-height: 1.5;
-        outline: none;
-      }
-
-      textarea:focus {
-        border-color: var(--accent);
-        box-shadow: 0 0 0 3px rgba(15, 122, 101, 0.16);
-      }
-
-      .actions {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-      }
-
-      .count {
-        color: var(--muted);
-        font-size: 13px;
-      }
-
-      button {
-        display: inline-flex;
-        min-height: 42px;
-        align-items: center;
-        justify-content: center;
-        gap: 8px;
-        border: 0;
-        border-radius: 8px;
-        background: var(--accent);
-        color: var(--accent-ink);
-        cursor: pointer;
-        font-weight: 720;
-        padding: 0 16px;
-      }
-
-      button:disabled {
-        cursor: wait;
-        opacity: 0.68;
-      }
-
-      .output {
-        flex: 1;
-        min-height: 220px;
-        overflow: auto;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        background: #fbfaf6;
-        padding: 16px;
-        white-space: pre-wrap;
-        line-height: 1.55;
-      }
-
-      .output[data-empty="true"] {
-        color: var(--muted);
-      }
-
-      @media (max-width: 860px) {
-        main {
-          grid-template-columns: 1fr;
-          padding-top: 28px;
-        }
-
-        .intro,
-        .workspace {
-          min-height: auto;
-        }
-
-        .intro {
-          gap: 36px;
-        }
-      }
-
-      @media (max-width: 620px) {
-        .shell {
-          width: min(100vw - 24px, 1120px);
-          padding-top: 18px;
-        }
-
-        header,
-        .actions {
-          align-items: flex-start;
-          flex-direction: column;
-        }
-
-        h1 {
-          font-size: 42px;
-        }
-
-        .facts {
-          grid-template-columns: 1fr;
-        }
-
-        button {
-          width: 100%;
-        }
-      }
-    </style>
-  </head>
-  <body>
-    <div class="shell">
-      <header>
-        <div class="brand">
-          <div class="mark" aria-hidden="true">S</div>
-          <span>Saskatoon AI</span>
-        </div>
-        <div class="status">
-          <span class="dot" id="statusDot"></span>
-          <span id="statusText">Checking Gemini</span>
-        </div>
-      </header>
-
-      <main>
-        <section class="intro" aria-labelledby="headline">
-          <div>
-            <h1 id="headline">Ship a Google Cloud AI webapp fast.</h1>
-            <p class="lede">
-              A Cloud Run-ready starter with Gemini wired through a server endpoint, keeping
-              credentials out of the browser and leaving room for Agent Platform workflows.
-            </p>
-          </div>
-          <div class="facts" aria-label="Stack">
-            <div class="fact">
-              <strong>Bun + TypeScript</strong>
-              <span>Single runtime for local development and production.</span>
-            </div>
-            <div class="fact">
-              <strong>Gemini SDK</strong>
-              <span>Uses the current Google GenAI package server-side.</span>
-            </div>
-            <div class="fact">
-              <strong>Cloud Run</strong>
-              <span>Listens on PORT and binds to 0.0.0.0.</span>
-            </div>
-          </div>
-        </section>
-
-        <section class="workspace" aria-label="Gemini workspace">
-          <div class="toolbar">
-            <h2>Prompt</h2>
-            <span class="model" id="modelLabel">gemini-2.5-flash</span>
-          </div>
-          <textarea
-            id="prompt"
-            maxlength="8000"
-            spellcheck="true"
-          >Draft a 90-second hackathon demo narrative for this app. Include the problem, the Google Cloud architecture, and the user payoff.</textarea>
-          <div class="actions">
-            <span class="count" id="count">0 / 8000</span>
-            <button id="submit" type="button">
-              <span aria-hidden="true">-></span>
-              Generate
-            </button>
-          </div>
-          <div class="output" id="output" data-empty="true">Gemini output will appear here.</div>
-        </section>
-      </main>
-    </div>
-
-    <script>
-      const promptEl = document.querySelector("#prompt");
-      const countEl = document.querySelector("#count");
-      const outputEl = document.querySelector("#output");
-      const submitEl = document.querySelector("#submit");
-      const statusTextEl = document.querySelector("#statusText");
-      const statusDotEl = document.querySelector("#statusDot");
-      const modelLabelEl = document.querySelector("#modelLabel");
-
-      function setOutput(text, isEmpty = false) {
-        outputEl.textContent = text;
-        outputEl.dataset.empty = String(isEmpty);
-      }
-
-      function updateCount() {
-        countEl.textContent = promptEl.value.length + " / 8000";
-      }
-
-      async function refreshStatus() {
-        try {
-          const response = await fetch("/healthz");
-          const data = await response.json();
-          statusTextEl.textContent = data.geminiConfigured ? "Gemini configured" : "Gemini not configured";
-          statusDotEl.style.background = data.geminiConfigured ? "#0f7a65" : "#9b5a14";
-        } catch {
-          statusTextEl.textContent = "Status unavailable";
-          statusDotEl.style.background = "#a43f3a";
-        }
-      }
-
-      async function generate() {
-        const prompt = promptEl.value.trim();
-
-        if (!prompt) {
-          setOutput("Prompt is required.", true);
-          return;
-        }
-
-        submitEl.disabled = true;
-        setOutput("Generating...");
-
-        try {
-          const response = await fetch("/api/generate", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ prompt }),
-          });
-          const data = await response.json();
-
-          if (!response.ok) {
-            setOutput(data.error ?? "Request failed.", true);
-            return;
-          }
-
-          modelLabelEl.textContent = data.model ?? "Gemini";
-          setOutput(data.text ?? "No text returned.");
-        } catch {
-          setOutput("Request failed before reaching the server.", true);
-        } finally {
-          submitEl.disabled = false;
-        }
-      }
-
-      promptEl.addEventListener("input", updateCount);
-      submitEl.addEventListener("click", generate);
-      promptEl.addEventListener("keydown", (event) => {
-        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-          generate();
-        }
-      });
-
-      updateCount();
-      refreshStatus();
-    </script>
-  </body>
-</html>`;

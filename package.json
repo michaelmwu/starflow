@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --watch src/index.ts",
+    "dev": "vite --host 0.0.0.0",
+    "dev:api": "bun --watch src/index.ts",
     "dev:local": "./scripts/dev-local.sh",
     "start": "bun run src/index.ts",
-    "build": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome format --write .",
@@ -21,13 +22,25 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.13",
+    "@tailwindcss/vite": "^4.3.1",
     "@types/bun": "^1.1.8",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
     "drizzle-kit": "^0.31.10",
-    "typescript": "^5.5.2"
+    "tailwindcss": "^4.3.1",
+    "typescript": "^5.5.2",
+    "vite": "^8.0.16"
   },
   "dependencies": {
     "@google/genai": "^2.9.0",
+    "@tanstack/react-query": "^5.101.0",
     "drizzle-orm": "^0.45.2",
-    "postgres": "^3.4.9"
+    "google-auth-library": "^10.7.0",
+    "hono": "^4.12.26",
+    "lucide-react": "^1.21.0",
+    "postgres": "^3.4.9",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
   }
 }

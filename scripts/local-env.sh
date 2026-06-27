@@ -42,7 +42,7 @@ hash_decimal() {
 default_postgres_port() {
   if is_positive_integer "${CONDUCTOR_PORT:-}"; then
     block_end=$((CONDUCTOR_PORT + RESERVED_BLOCK_SIZE - 1))
-    used=" ${PORT:-} "
+    used=" ${VITE_PORT:-} ${PORT:-} "
     unused_port_in_block "$((CONDUCTOR_PORT + 1))" "$block_end" "$used"
     return 0
   fi
@@ -115,8 +115,23 @@ default_app_port() {
   echo 3000
 }
 
+load_dotenv() {
+  if [ -f ".env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+  fi
+}
+
 load_env() {
-  PORT="${PORT:-$(default_app_port)}"
+  load_dotenv
+  VITE_PORT="${VITE_PORT:-$(default_app_port)}"
+  if is_positive_integer "${CONDUCTOR_PORT:-}"; then
+    PORT="${PORT:-$(unused_port_in_block "$((CONDUCTOR_PORT + 1))" "$((CONDUCTOR_PORT + RESERVED_BLOCK_SIZE - 1))" " ${VITE_PORT:-} ")}"
+  else
+    PORT="${PORT:-3000}"
+  fi
   POSTGRES_HOST_BIND="${POSTGRES_HOST_BIND:-127.0.0.1}"
   POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-$(default_postgres_port)}"
   POSTGRES_DB="${POSTGRES_DB:-agent_context}"
@@ -127,6 +142,7 @@ load_env() {
 
 print_env() {
   load_env
+  printf 'VITE_PORT=%s\n' "$VITE_PORT"
   printf 'PORT=%s\n' "$PORT"
   printf 'POSTGRES_HOST_BIND=%s\n' "$POSTGRES_HOST_BIND"
   printf 'POSTGRES_HOST_PORT=%s\n' "$POSTGRES_HOST_PORT"
@@ -138,7 +154,7 @@ print_env() {
 
 export_env() {
   load_env
-  export PORT POSTGRES_HOST_BIND POSTGRES_HOST_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL
+  export VITE_PORT PORT POSTGRES_HOST_BIND POSTGRES_HOST_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL
 }
 
 case "${1:-env}" in

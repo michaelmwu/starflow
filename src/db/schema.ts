@@ -1,4 +1,15 @@
-import { index, jsonb, pgTable, text, timestamp, unique, uuid, vector } from "drizzle-orm/pg-core";
+import {
+  boolean,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  unique,
+  uuid,
+  vector,
+} from "drizzle-orm/pg-core";
 
 export const appUsers = pgTable("app_users", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -90,4 +101,73 @@ export const agentMemoryEmbeddings = pgTable(
       table.embedding.op("vector_cosine_ops"),
     ),
   ],
+);
+
+export const brainDumps = pgTable(
+  "brain_dumps",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUsers.id, { onDelete: "cascade" }),
+    rawText: text("raw_text").notNull(),
+    extracted: jsonb("extracted").notNull().default({}),
+    emotionalTone: text("emotional_tone"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("brain_dumps_user_created_idx").on(table.userId, table.createdAt)],
+);
+
+export const tasks = pgTable(
+  "tasks",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUsers.id, { onDelete: "cascade" }),
+    brainDumpId: uuid("brain_dump_id").references(() => brainDumps.id, { onDelete: "set null" }),
+    title: text("title").notNull(),
+    whyItMatters: text("why_it_matters"),
+    status: text("status", { enum: ["open", "done"] })
+      .notNull()
+      .default("open"),
+    encouragement: text("encouragement"),
+    emotionalTone: text("emotional_tone"),
+    otherTasks: jsonb("other_tasks").notNull().default([]),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("tasks_user_status_created_idx").on(table.userId, table.status, table.createdAt),
+  ],
+);
+
+export const taskSteps = pgTable(
+  "task_steps",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => tasks.id, { onDelete: "cascade" }),
+    content: text("content").notNull(),
+    position: integer("position").notNull().default(0),
+    done: boolean("done").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("task_steps_task_position_idx").on(table.taskId, table.position)],
+);
+
+export const reflections = pgTable(
+  "reflections",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => appUsers.id, { onDelete: "cascade" }),
+    answers: jsonb("answers").notNull().default({}),
+    carryForward: text("carry_forward"),
+    summary: text("summary"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("reflections_user_created_idx").on(table.userId, table.createdAt)],
 );

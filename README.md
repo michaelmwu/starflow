@@ -1,12 +1,21 @@
-# Saskatoon AI
+# Starflow
 
-Cloud Run-ready Bun + TypeScript webapp with a server-side Gemini integration.
+Mobile-first ADHD support app with a server-side Gemini integration. Starflow helps users capture scattered thoughts, choose one next step, and reflect without turning the browser into a credential surface.
+
+Product and engineering decisions are tracked in:
+
+- `docs/product-decisions.md`
+- `docs/engineering-decisions.md`
+- `docs/starflow-mvp-plan.md`
 
 ## Stack
 
-- Bun HTTP server with TypeScript.
+- Bun + Hono HTTP server with TypeScript.
+- Vite + React frontend.
+- Tailwind CSS v4 styling.
+- TanStack Query for frontend server state.
 - Google GenAI SDK (`@google/genai`) for Gemini.
-- Static frontend served by the same process.
+- Static Starflow frontend served by the same process.
 - Cloud Run container contract: listens on `0.0.0.0` and `PORT`.
 
 ## Local Setup
@@ -44,13 +53,20 @@ GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=global
 ```
 
-Run the app:
+Run the API and Vite frontend separately for low-level debugging:
 
 ```bash
+bun run dev:api
 bun run dev
 ```
 
-Open `http://localhost:3000`.
+For normal local development, prefer the integrated script:
+
+```bash
+bun run dev:local
+```
+
+In Conductor, this uses the allocated 10-port block: Vite on the browser-safe app port, Bun/Hono API on the next port, and Postgres on another port in the block.
 
 ## Local Postgres
 
@@ -61,14 +77,13 @@ bun run db:up
 bun run db:migrate
 ```
 
-Or start Postgres, apply migrations, and run the app in one command:
+Or start Postgres, apply migrations, and run the full local stack in one command:
 
 ```bash
 bun run dev:local
 ```
 
-`dev:local` uses the Conductor-allocated `PORT` when available and stops the
-local Postgres service when you press Ctrl-C.
+`dev:local` uses the Conductor-allocated port block when available and stops the local Postgres service when you press Ctrl-C.
 
 The local scripts derive a worktree-specific Postgres port, so parallel Conductor workspaces do not all bind to `5432`. To inspect the generated values:
 
@@ -76,7 +91,18 @@ The local scripts derive a worktree-specific Postgres port, so parallel Conducto
 ./scripts/local-env.sh env
 ```
 
-The initial schema covers users, Google OAuth accounts, agent sessions/messages, memories, and `vector(768)` memory embeddings. Drizzle schema lives in `src/db/schema.ts`; the bootstrap SQL migration lives in `db/migrations/`.
+The schema covers users, Google OAuth accounts, agent sessions/messages, memories, `vector(768)` memory embeddings, brain dumps, focus tasks, and task steps. Drizzle schema lives in `src/db/schema.ts`; bootstrap SQL migrations live in `db/migrations/`.
+
+## MVP API
+
+- `POST /api/auth/demo` signs in as the local demo user.
+- `POST /api/auth/google` verifies a Google Identity Services ID token when `GOOGLE_OAUTH_CLIENT_ID` is configured.
+- `GET /api/me` returns the signed-in user.
+- `GET /api/state` returns the latest open focus task.
+- `POST /api/triage` turns a brain dump into one main quest and tiny steps.
+- `PATCH /api/steps/:id` toggles a tiny step.
+- `POST /api/chat` runs the role-specific page agent for landing, sign-in, capture, or focus.
+- `POST /api/events` routes voice/image/text, task-edited, and task-completed events through the Sense -> Classifier -> Triage -> Coach -> Breakdown orchestrator contract.
 
 ## Google Cloud Bootstrap
 
