@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Playfair Display", ui-serif, Georgia, serif;
+  --color-void: #0b0e14;
+  --color-night: #111415;
+  --color-glass: rgba(255, 255, 255, 0.04);
+  --color-line: rgba(255, 255, 255, 0.1);
+  --color-starlight: #e1e3e4;
+  --color-mist: #c6c6cb;
+  --color-dim: #909095;
+  --color-indigo-soft: #bec2ff;
+  --color-indigo-deep: #3139b0;
+  --color-gold-soft: #e9c349;
+}
+
+html {
+  background: #0b0e14;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 76% 0%, rgba(190, 194, 255, 0.14), transparent 34%),
+    radial-gradient(circle at 12% 22%, rgba(233, 195, 73, 0.08), transparent 26%), #0b0e14;
+  color: #e1e3e4;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.glass {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(20px);
+}
+
+.button-glow {
+  transition:
+    box-shadow 260ms ease,
+    transform 260ms ease,
+    opacity 260ms ease;
+}
+
+.button-glow:hover {
+  box-shadow: 0 0 22px rgba(190, 194, 255, 0.3);
+  transform: translateY(-1px);
+}
+
+.hero-backdrop {
+  background-image:
+    linear-gradient(to bottom, rgba(11, 14, 20, 0.08), #0b0e14 90%),
+    url("https://lh3.googleusercontent.com/aida/AP1WRLtHQNvydXexJNfNakTcd5RgQqT3lO-cXeEQOPkSsYci_hAwswgkJ2Nq1a4NdzWfNKBR6bnld4M6XQF35wDNCm-TSWlFPfCzLxkJSd4_1xxZafMC8FY1XER4X0jKtz25xbSw85xEAGJpTasMLysIMeMotVV4BHxEJ7YZY_D5sno4QPmV31DbzoP0niDk7taNXOf5w73JDmBN-U4-yDnEZzfpkiHPv6vD7ne-rHCC12yLqD3lTCIwvy6xQA");
+  background-position: center top;
+  background-size: cover;
+}

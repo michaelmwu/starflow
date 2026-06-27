@@ -1,0 +1,5 @@
+# Compatibility wrapper for tools that still look for docker-compose.yml.
+# Requires Docker Compose v2.20+ for top-level include support.
+# Prefer compose.yml for new edits.
+include:
+  - compose.yml
