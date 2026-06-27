@@ -55,6 +55,14 @@ type TriageResult = {
   encouragement?: string;
 };
 
+type MemoryCategoryResult = {
+  categories?: Array<{
+    name?: string;
+    summary?: string;
+    memory_ids?: string[];
+  }>;
+};
+
 function envValue(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value && value.length > 0 ? value : undefined;
@@ -447,7 +455,7 @@ function triageSchema() {
       tiny_steps: {
         type: Type.ARRAY,
         description:
-          "5 to 9 ordered micro-steps that move the focus from start to finish. The first step should take about two minutes.",
+          "4 to 6 short, high-leverage steps. The first step should take about two minutes.",
         items: { type: Type.STRING },
       },
       detected_deadlines: {
@@ -494,6 +502,57 @@ function reflectionSchema() {
       tomorrow_experiment: { type: Type.STRING },
     },
     required: ["summary", "pattern", "small_win", "tomorrow_experiment"],
+  };
+}
+
+function dailyReportSchema() {
+  return {
+    type: Type.OBJECT,
+    properties: {
+      headline: { type: Type.STRING },
+      encouragement: { type: Type.STRING },
+      observations: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+      },
+      threads: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            label: { type: Type.STRING },
+            detail: { type: Type.STRING },
+          },
+          required: ["label", "detail"],
+        },
+      },
+      carry_forward: { type: Type.STRING },
+    },
+    required: ["headline", "encouragement", "observations", "threads", "carry_forward"],
+  };
+}
+
+function memoryCategoriesSchema() {
+  return {
+    type: Type.OBJECT,
+    properties: {
+      categories: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            name: { type: Type.STRING },
+            summary: { type: Type.STRING },
+            memory_ids: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
+          },
+          required: ["name", "summary", "memory_ids"],
+        },
+      },
+    },
+    required: ["categories"],
   };
 }
 
@@ -602,9 +661,8 @@ function normalizeSteps(rawSteps: unknown): string[] {
     return [
       "Open the relevant app, page, object, or space.",
       "Name the smallest visible outcome.",
-      "Gather only what is needed for the next move.",
+      "Gather only what is needed.",
       "Do the first two-minute action.",
-      "Check what changed and choose the next tiny move.",
     ];
   }
 
@@ -612,7 +670,7 @@ function normalizeSteps(rawSteps: unknown): string[] {
     .filter((step): step is string => typeof step === "string")
     .map((step) => step.trim())
     .filter(Boolean)
-    .slice(0, 10);
+    .slice(0, 6);
 
   return steps.length > 0 ? steps : normalizeSteps(null);
 }
@@ -641,9 +699,9 @@ async function generateTriage(text: string): Promise<TriageResult> {
       systemInstruction: [
         "You help an ADHD person who just brain-dumped.",
         "From their mess, pick the SINGLE most relieving thing to focus on right now, not necessarily the most important.",
-        "Break the focus into 5 to 9 genuinely tiny, concrete steps in order.",
+        "Break the focus into 4 to 6 short, concrete steps in order.",
         "The first step must be doable in about two minutes. Each step is one small physical action.",
-        "Cover the task from start to finish, not just the beginning.",
+        "Do not over-explain. Prefer short step labels over detailed instructions.",
         "Be warm and brief. Never lecture. Never tell them to just do something.",
       ].join(" "),
       responseMimeType: "application/json",
@@ -752,6 +810,251 @@ async function loadMemoryState(userId: string) {
         }
       : null,
   };
+}
+
+async function loadScatterMemories(userId: string, limit = 60) {
+  return db
+    .select()
+    .from(agentMemories)
+    .where(and(eq(agentMemories.userId, userId), eq(agentMemories.sourceKind, "manual")))
+    .orderBy(desc(agentMemories.createdAt))
+    .limit(limit);
+}
+
+function memorySnippet(content: string): string {
+  return content.length > 180 ? `${content.slice(0, 177)}...` : content;
+}
+
+function localMemoryCategory(content: string): string {
+  const lower = content.toLowerCase();
+
+  if (/(overwhelm|stuck|tired|shame|sad|mad|angry|feel|feeling|worry|worried)/.test(lower)) {
+    return "Emotional sparks";
+  }
+
+  if (/(reply|email|call|tax|bill|appointment|schedule|calendar|paperwork|admin)/.test(lower)) {
+    return "Life admin";
+  }
+
+  if (/(build|make|write|design|idea|app|project|create|draft)/.test(lower)) {
+    return "Creative ideas";
+  }
+
+  if (/(clean|kitchen|room|laundry|dish|desk|home|trash)/.test(lower)) {
+    return "Home and space";
+  }
+
+  return "Loose thoughts";
+}
+
+function fallbackMemoryCategories(memories: Awaited<ReturnType<typeof loadScatterMemories>>) {
+  const grouped = new Map<string, typeof memories>();
+
+  for (const memory of memories) {
+    const name = localMemoryCategory(memory.content);
+    grouped.set(name, [...(grouped.get(name) ?? []), memory]);
+  }
+
+  return [...grouped.entries()].map(([name, rows]) => ({
+    name,
+    summary: `${rows.length} saved thought${rows.length === 1 ? "" : "s"}.`,
+    memories: rows.map((memory) => ({
+      id: memory.id,
+      content: memory.content,
+      createdAt: memory.createdAt.toISOString(),
+    })),
+  }));
+}
+
+async function categorizeMemories(memories: Awaited<ReturnType<typeof loadScatterMemories>>) {
+  if (memories.length === 0 || !hasUsableCredentials()) {
+    return { categories: fallbackMemoryCategories(memories), usedModel: false };
+  }
+
+  const byId = new Map(memories.map((memory) => [memory.id, memory]));
+  const prompt = [
+    "Categorize these Scatter thoughts for an ADHD support app.",
+    "Use warm, practical category names like Creative ideas, Life admin, Emotional sparks, Home and space, People, Health, Money, or Loose thoughts.",
+    "Every memory id must appear in exactly one category. Do not diagnose the user.",
+    memories
+      .map(
+        (memory) => `- ${memory.id}: ${memorySnippet(memory.content).replace(/\s+/g, " ").trim()}`,
+      )
+      .join("\n"),
+  ].join("\n\n");
+
+  try {
+    const client = createClient();
+    const response = await client.models.generateContent({
+      model: modelName(),
+      contents: prompt,
+      config: {
+        systemInstruction:
+          "You organize saved user thoughts into gentle, useful buckets. Return only JSON.",
+        responseMimeType: "application/json",
+        responseSchema: memoryCategoriesSchema(),
+        temperature: 0.25,
+        maxOutputTokens: 2_500,
+      },
+    });
+    const parsed = parseModelJson<MemoryCategoryResult>(modelResponseText(response));
+    const assigned = new Set<string>();
+    const categories =
+      parsed.categories
+        ?.map((category) => {
+          const rows =
+            category.memory_ids
+              ?.map((id) => byId.get(id))
+              .filter((memory): memory is (typeof memories)[number] => Boolean(memory)) ?? [];
+
+          for (const row of rows) {
+            assigned.add(row.id);
+          }
+
+          return {
+            name: category.name?.trim() || "Loose thoughts",
+            summary: category.summary?.trim() || `${rows.length} saved thoughts.`,
+            memories: rows.map((memory) => ({
+              id: memory.id,
+              content: memory.content,
+              createdAt: memory.createdAt.toISOString(),
+            })),
+          };
+        })
+        .filter((category) => category.memories.length > 0) ?? [];
+    const unassigned = memories.filter((memory) => !assigned.has(memory.id));
+
+    if (unassigned.length > 0) {
+      categories.push(...fallbackMemoryCategories(unassigned));
+    }
+
+    return {
+      categories: categories.length > 0 ? categories : fallbackMemoryCategories(memories),
+      usedModel: categories.length > 0,
+    };
+  } catch (error) {
+    logServerError("Memory categorization failed.", error);
+    return { categories: fallbackMemoryCategories(memories), usedModel: false };
+  }
+}
+
+function exampleDailyReport() {
+  return {
+    headline: "You showed up today.",
+    encouragement:
+      "You did great. Even opening the loop counts: you gave the day somewhere softer to land.",
+    observations: [
+      "A scattered thought became visible instead of staying in your head.",
+      "There is enough here to choose one next step without judging the whole day.",
+      "Returning to the system is the win, even before anything is finished.",
+    ],
+    threads: [
+      {
+        label: "Scatter",
+        detail: "Thoughts are being captured before they need to be organized.",
+      },
+      {
+        label: "Flow",
+        detail: "One small focus can be enough for a real day.",
+      },
+      {
+        label: "Kind reframe",
+        detail: "You are not starting over; you are returning.",
+      },
+    ],
+    carryForward: "Showing up counts.",
+  };
+}
+
+async function generateDailyReport(userId: string) {
+  const [memories, task] = await Promise.all([
+    loadScatterMemories(userId, 12),
+    loadOpenTask(userId),
+  ]);
+
+  if (memories.length === 0 && !task) {
+    return { report: exampleDailyReport(), usedModel: false, example: true };
+  }
+
+  if (!hasUsableCredentials()) {
+    const report = exampleDailyReport();
+    return {
+      report: {
+        ...report,
+        observations: [
+          `${memories.length} Scatter thought${memories.length === 1 ? "" : "s"} saved today.`,
+          task ? `Current Flow focus: ${task.title}.` : "Flow is ready when you pick a thought.",
+          "You showed up by making the invisible visible.",
+        ],
+      },
+      usedModel: false,
+      example: false,
+    };
+  }
+
+  const prompt = [
+    "Create a gentle daily map for a Starflow user from Scatter memories and Flow state.",
+    "Avoid clinical labels. Do not mention diagnosis. Be warm, concrete, and brief.",
+    "Include encouragement like: you did great, you showed up.",
+    `Scatter memories:\n${
+      memories.length > 0
+        ? memories.map((memory) => `- ${memorySnippet(memory.content)}`).join("\n")
+        : "- none yet"
+    }`,
+    task
+      ? `Flow task: ${task.title}\nSteps: ${task.steps
+          .map((step) => `${step.done ? "[done]" : "[open]"} ${step.content}`)
+          .join("; ")}`
+      : "Flow task: none yet",
+  ].join("\n\n");
+
+  try {
+    const client = createClient();
+    const response = await client.models.generateContent({
+      model: modelName(),
+      contents: prompt,
+      config: {
+        systemInstruction:
+          "You synthesize a supportive daily report from user-owned app data. Return only JSON.",
+        responseMimeType: "application/json",
+        responseSchema: dailyReportSchema(),
+        temperature: 0.35,
+        maxOutputTokens: 2_000,
+      },
+    });
+    const parsed = parseModelJson<{
+      headline?: string;
+      encouragement?: string;
+      observations?: string[];
+      threads?: Array<{ label?: string; detail?: string }>;
+      carry_forward?: string;
+    }>(modelResponseText(response));
+    const fallback = exampleDailyReport();
+
+    return {
+      report: {
+        headline: parsed.headline?.trim() || fallback.headline,
+        encouragement: parsed.encouragement?.trim() || fallback.encouragement,
+        observations:
+          parsed.observations
+            ?.filter((item): item is string => typeof item === "string")
+            .slice(0, 4) ?? fallback.observations,
+        threads:
+          parsed.threads
+            ?.map((thread) => ({
+              label: thread.label?.trim() || "Signal",
+              detail: thread.detail?.trim() || "Something worth noticing showed up.",
+            }))
+            .slice(0, 4) ?? fallback.threads,
+        carryForward: parsed.carry_forward?.trim() || fallback.carryForward,
+      },
+      usedModel: true,
+      example: false,
+    };
+  } catch (error) {
+    logServerError("Daily report generation failed.", error);
+    return { report: exampleDailyReport(), usedModel: false, example: true };
+  }
 }
 
 async function loadOwnedTask(userId: string, taskId: string) {
@@ -1469,6 +1772,24 @@ app.post("/api/memories", async (c) => {
   });
 });
 
+app.get("/api/memories/categorized", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before viewing Scatter memories." }, 401);
+  }
+
+  const memories = await loadScatterMemories(user.id);
+  const result = await categorizeMemories(memories);
+
+  return c.json({
+    total: memories.length,
+    categories: result.categories,
+    usedModel: result.usedModel,
+    model: result.usedModel ? modelName() : null,
+  });
+});
+
 app.get("/api/state", async (c) => {
   const user = await requireUser(c);
 
@@ -1482,6 +1803,17 @@ app.get("/api/state", async (c) => {
     loadMemoryState(user.id),
   ]);
   return c.json({ task, reflection, memory });
+});
+
+app.get("/api/reflect/report", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before loading your reflection map." }, 401);
+  }
+
+  const result = await generateDailyReport(user.id);
+  return c.json(result);
 });
 
 app.post("/api/reflect", async (c) => {
@@ -1817,7 +2149,7 @@ app.post("/api/chat", async (c) => {
     `Instruction: ${roleInstruction}`,
     "Agent boundaries: Context normalizes available context; Task Extraction detects actionable tasks; Prioritization ranks selected active tasks; Breakdown rewrites executable subtasks. Do not invent unrelated work.",
     "Mutation rule: when the user asks for a visible task/list change, call a tool instead of only chatting about it.",
-    "Step-list rule: replacement step lists should contain 5 to 9 ordered micro-steps. Make them specific to the user's actual task, recipe, object, or context.",
+    "Step-list rule: replacement step lists should contain 4 to 6 short ordered steps. Make them specific, but avoid over-explaining.",
     "Example: if the active task is a recipe and the user says 'change it to pasta and update the todo list', call rewrite_task and replace_steps with real pasta steps.",
     `User: ${userLabel}`,
     ownedTask
@@ -1866,22 +2198,33 @@ app.post("/api/chat", async (c) => {
         const functionResponseParts = [];
 
         for (const call of functionCalls) {
-          const result = await executeAgentTool({
-            call,
-            ownedTask,
-            uiContext,
-            user,
-          });
+          let response: Record<string, unknown>;
 
-          Object.assign(uiPatch, result.uiPatch);
-          updatedTask = result.task ?? updatedTask;
-          if (ownedTask) {
-            ownedTask = (await loadOwnedTask(user.id, ownedTask.task.id)) ?? ownedTask;
+          try {
+            const result = await executeAgentTool({
+              call,
+              ownedTask,
+              uiContext,
+              user,
+            });
+
+            Object.assign(uiPatch, result.uiPatch);
+            updatedTask = result.task ?? updatedTask;
+            if (ownedTask) {
+              ownedTask = (await loadOwnedTask(user.id, ownedTask.task.id)) ?? ownedTask;
+            }
+            response = result.response;
+          } catch (error) {
+            response = {
+              ok: false,
+              error: error instanceof Error ? error.message : "Tool call failed.",
+            };
           }
+
           functionResponseParts.push({
             functionResponse: {
               name: call.name ?? "unknown_tool",
-              response: result.response,
+              response,
             },
           });
         }

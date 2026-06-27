@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRight,
   Bot,
+  Camera,
   Check,
   CheckCircle2,
   Compass,
@@ -69,6 +70,26 @@ type MemoryState = {
   } | null;
 };
 
+type CategorizedMemory = {
+  id: string;
+  content: string;
+  createdAt: string;
+};
+
+type MemoryCategory = {
+  name: string;
+  summary: string;
+  memories: CategorizedMemory[];
+};
+
+type DailyReport = {
+  headline: string;
+  encouragement: string;
+  observations: string[];
+  threads: Array<{ label: string; detail: string }>;
+  carryForward: string;
+};
+
 type AppState = {
   task: FocusTask | null;
   reflection: ReflectionState;
@@ -81,7 +102,8 @@ type Config = {
   model: string;
 };
 
-type Screen = "landing" | "signin" | "capture" | "focus" | "reflect";
+type Screen = "landing" | "signin" | "capture" | "focus" | "reflect" | "thoughts";
+type ChatAgent = "landing" | "signin" | "capture" | "focus" | "reflect";
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -194,6 +216,23 @@ export function App() {
   const user = meQuery.data?.user ?? null;
   const task = stateQuery.data?.task ?? null;
   const memory = stateQuery.data?.memory ?? { count: 0, latest: null };
+  const categorizedMemoriesQuery = useQuery({
+    queryKey: ["memories", "categorized"],
+    enabled: Boolean(user && screen === "thoughts"),
+    queryFn: () =>
+      api<{
+        total: number;
+        categories: MemoryCategory[];
+        usedModel: boolean;
+        model: string | null;
+      }>("/api/memories/categorized"),
+  });
+  const dailyReportQuery = useQuery({
+    queryKey: ["reflect", "report"],
+    enabled: Boolean(user && screen === "reflect"),
+    queryFn: () =>
+      api<{ report: DailyReport; usedModel: boolean; example: boolean }>("/api/reflect/report"),
+  });
 
   useEffect(() => {
     const onPopState = () => {
@@ -298,8 +337,8 @@ export function App() {
         method: "POST",
         body: JSON.stringify({
           answers: {
-            tried: reflectionAnswers.tried,
-            hard: reflectionAnswers.hard,
+            tried: reflectionAnswers.proud ? "Reviewed the daily map" : "",
+            hard: "",
             proud: reflectionAnswers.proud,
           },
           carryForward: reflectionAnswers.carry,
@@ -340,7 +379,8 @@ export function App() {
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["state"] }),
   });
 
-  const currentAgent: Screen = task && screen === "focus" ? "focus" : screen;
+  const currentAgent: ChatAgent =
+    screen === "thoughts" ? "capture" : task && screen === "focus" ? "focus" : screen;
   const handleScreen = (nextScreen: Screen) => {
     if (nextScreen === "focus") {
       setScreen("focus");
@@ -416,7 +456,19 @@ export function App() {
               user={user}
               onChange={setDumpText}
               onSubmit={() => memoryMutation.mutate(dumpText)}
+              onViewThoughts={() => setScreen("thoughts")}
               onLogout={() => logoutMutation.mutate()}
+            />
+          ) : null}
+
+          {user && screen === "thoughts" ? (
+            <ThoughtsPanel
+              categories={categorizedMemoriesQuery.data?.categories ?? []}
+              error={categorizedMemoriesQuery.error?.message}
+              loading={categorizedMemoriesQuery.isLoading}
+              total={categorizedMemoriesQuery.data?.total ?? 0}
+              usedModel={categorizedMemoriesQuery.data?.usedModel ?? false}
+              onBack={() => setScreen("capture")}
             />
           ) : null}
 
@@ -451,6 +503,8 @@ export function App() {
               answers={reflectionAnswers}
               error={reflectionMutation.error?.message}
               latest={stateQuery.data?.reflection.latest ?? null}
+              report={dailyReportQuery.data?.report ?? null}
+              reportLoading={dailyReportQuery.isLoading}
               loading={reflectionMutation.isPending}
               reflectionCount={stateQuery.data?.reflection.count ?? 0}
               user={user}
@@ -722,6 +776,7 @@ function CapturePanel({
   onChange,
   onLogout,
   onSubmit,
+  onViewThoughts,
   user,
 }: {
   dumpText: string;
@@ -733,6 +788,7 @@ function CapturePanel({
   onChange: (value: string) => void;
   onLogout: () => void;
   onSubmit: () => void;
+  onViewThoughts: () => void;
   user: User;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -800,7 +856,7 @@ function CapturePanel({
         <div className="relative">
           <textarea
             ref={textareaRef}
-            className="min-h-44 w-full resize-y rounded-[1.35rem] border border-white/10 bg-white/5 p-4 pr-12 text-starlight outline-none transition focus:border-indigo-soft focus:shadow-[0_0_20px_rgba(190,194,255,0.18)] md:min-h-32 md:rounded-[1.5rem] md:p-5 md:pr-14"
+            className="min-h-44 w-full resize-y rounded-[1.35rem] border border-white/10 bg-white/5 p-4 text-starlight outline-none transition focus:border-indigo-soft focus:shadow-[0_0_20px_rgba(190,194,255,0.18)] md:min-h-32 md:rounded-[1.5rem] md:p-5"
             maxLength={8000}
             placeholder="Type a spark of thought..."
             value={dumpText}
@@ -811,11 +867,30 @@ function CapturePanel({
               }
             }}
           />
-          <Mic className="absolute right-4 top-4 text-dim md:right-5 md:top-5" size={22} />
         </div>
         <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
           <span className="text-dim text-sm">{dumpText.length} / 8000</span>
           <span className="text-dim text-xs">{model}</span>
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            className="inline-flex items-center justify-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-3 font-bold text-dim text-sm"
+            disabled
+            title="Voice capture is a demo placeholder."
+          >
+            <Mic size={17} />
+            Voice
+          </button>
+          <button
+            type="button"
+            className="inline-flex items-center justify-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-3 font-bold text-dim text-sm"
+            disabled
+            title="Photo capture is a demo placeholder."
+          >
+            <Camera size={17} />
+            Photo
+          </button>
         </div>
         <button
           type="button"
@@ -827,12 +902,118 @@ function CapturePanel({
           {loading ? "Saving..." : "Save to memory"}
         </button>
         {memory.latest ? (
-          <p className="mt-3 text-center text-dim text-sm">
-            {memory.count} thought{memory.count === 1 ? "" : "s"} remembered. Open Flow to triage
-            the latest one.
-          </p>
+          <div className="mt-3 flex flex-wrap items-center justify-center gap-2 text-center text-sm">
+            <span className="text-dim">
+              {memory.count} thought{memory.count === 1 ? "" : "s"} remembered.
+            </span>
+            <button
+              type="button"
+              className="font-bold text-indigo-soft hover:text-starlight"
+              onClick={onViewThoughts}
+            >
+              View categorized thoughts
+            </button>
+          </div>
         ) : null}
         {error ? <p className="mt-4 text-red-200 text-sm">{error}</p> : null}
+      </div>
+    </div>
+  );
+}
+
+function ThoughtsPanel({
+  categories,
+  error,
+  loading,
+  onBack,
+  total,
+  usedModel,
+}: {
+  categories: MemoryCategory[];
+  error: string | undefined;
+  loading: boolean;
+  onBack: () => void;
+  total: number;
+  usedModel: boolean;
+}) {
+  return (
+    <div className="mx-auto max-w-[900px]">
+      <div className="glass rounded-[2rem] p-5 md:p-8">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-white/10 border-b pb-4">
+          <div className="flex items-center gap-3">
+            <div className="grid size-10 place-items-center rounded-full border border-indigo-soft/40 bg-indigo-soft/10 text-indigo-soft">
+              <Sparkles size={18} />
+            </div>
+            <div>
+              <p className="font-bold">Scatter thoughts</p>
+              <p className="text-dim text-xs">
+                {usedModel ? "Categorized by Gemini" : "Grouped locally"}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="rounded-full border border-white/10 px-4 py-2 text-dim text-sm"
+            onClick={onBack}
+          >
+            Back to Scatter
+          </button>
+        </div>
+
+        <div className="mt-7">
+          <p className="font-bold text-indigo-soft text-sm uppercase tracking-[0.18em]">
+            Thought map
+          </p>
+          <h3 className="mt-3 font-serif text-4xl text-starlight leading-tight md:text-5xl">
+            What you have been carrying.
+          </h3>
+          <p className="mt-4 text-mist leading-7">
+            {total > 0
+              ? `${total} saved Scatter thought${total === 1 ? "" : "s"}, grouped into patterns.`
+              : "Save a Scatter thought first, then this page will organize it into patterns."}
+          </p>
+        </div>
+
+        {loading ? <p className="mt-8 text-mist">Categorizing your thoughts...</p> : null}
+        {error ? <p className="mt-6 text-red-200 text-sm">{error}</p> : null}
+
+        {!loading && categories.length > 0 ? (
+          <div className="mt-8 grid gap-4 md:grid-cols-2">
+            {categories.map((category) => (
+              <section
+                className="rounded-[1.5rem] border border-white/10 bg-white/5 p-5"
+                key={category.name}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h4 className="font-serif text-2xl text-starlight">{category.name}</h4>
+                    <p className="mt-2 text-dim text-sm leading-6">{category.summary}</p>
+                  </div>
+                  <span className="rounded-full bg-indigo-soft/15 px-3 py-1 text-indigo-soft text-xs">
+                    {category.memories.length}
+                  </span>
+                </div>
+                <div className="mt-4 grid gap-3">
+                  {category.memories.map((memory) => (
+                    <article
+                      className="rounded-[1rem] border border-white/10 bg-night/60 p-3 text-mist text-sm leading-6"
+                      key={memory.id}
+                    >
+                      {memory.content}
+                    </article>
+                  ))}
+                </div>
+              </section>
+            ))}
+          </div>
+        ) : null}
+
+        {!loading && categories.length === 0 ? (
+          <div className="mt-8 rounded-[1.5rem] border border-white/10 bg-white/5 p-5 text-mist">
+            Nothing saved yet. Scatter is the place to drop thoughts before they need to become
+            action.
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -1057,6 +1238,8 @@ function ReflectPanel({
   onAnswers,
   onLogout,
   onSubmit,
+  report,
+  reportLoading,
   reflectionCount,
   user,
 }: {
@@ -1069,12 +1252,32 @@ function ReflectPanel({
   >;
   onLogout: () => void;
   onSubmit: () => void;
+  report: DailyReport | null;
+  reportLoading: boolean;
   reflectionCount: number;
   user: User;
 }) {
-  const answered = [answers.tried, answers.hard, answers.proud].filter(
-    (answer) => answer.trim().length > 0,
-  ).length;
+  const reflectionSignals = ["I showed up", "I made something visible", "I came back gently"];
+  const carryChoices = ["Showing up counts", "Quiet Focus", "Self-Kindness", "One next step"];
+  const activeReport =
+    report ??
+    ({
+      headline: "You showed up today.",
+      encouragement:
+        "You did great. Even opening this page counts as returning to yourself with care.",
+      observations: [
+        "Scatter gives your thoughts somewhere to land.",
+        "Flow can turn one saved thought into a lighter next step.",
+        "Reflect is here to notice effort, not grade output.",
+      ],
+      threads: [
+        {
+          label: "Kind reframe",
+          detail: "You are not starting over; you are returning.",
+        },
+      ],
+      carryForward: "Showing up counts",
+    } satisfies DailyReport);
 
   return (
     <div className="mx-auto max-w-[760px]">
@@ -1085,56 +1288,75 @@ function ReflectPanel({
             Before you sleep
           </p>
           <h3 className="mt-3 font-serif text-4xl text-starlight leading-tight md:text-5xl">
-            Let the day settle.
+            {reportLoading ? "Mapping the day..." : activeReport.headline}
           </h3>
-          <p className="mt-4 text-mist leading-7">
-            Answer what feels easy. Every new attempt is a star added to your map.
-          </p>
+          <p className="mt-4 text-mist leading-7">{activeReport.encouragement}</p>
         </div>
 
         <div className="mt-8 grid gap-4">
-          <ReflectionPrompt
-            icon={<Compass size={20} />}
-            label="What did you try today?"
-            value={answers.tried}
-            onChange={(value) => onAnswers((current) => ({ ...current, tried: value }))}
-          />
-          <ReflectionPrompt
-            icon={<Bot size={20} />}
-            label="What felt hard?"
-            value={answers.hard}
-            onChange={(value) => onAnswers((current) => ({ ...current, hard: value }))}
-          />
-          <ReflectionPrompt
-            icon={<Stars size={20} />}
-            label="What are you proud of?"
-            value={answers.proud}
-            onChange={(value) => onAnswers((current) => ({ ...current, proud: value }))}
-          />
-          <div className="glass rounded-[1.75rem] p-5">
-            <div className="flex items-start gap-4">
-              <Moon className="mt-1 text-indigo-soft" size={20} />
-              <div className="min-w-0 flex-1">
-                <label className="font-serif text-2xl text-starlight" htmlFor="carry-forward">
-                  What should carry into tomorrow?
-                </label>
-                <div className="mt-4 flex flex-wrap gap-2">
-                  {["Persistence", "Quiet Focus", "Self-Kindness"].map((chip) => (
-                    <button
-                      className={`rounded-full border px-4 py-2 text-sm ${
-                        answers.carry === chip
-                          ? "border-indigo-soft bg-indigo-soft/20 text-indigo-soft"
-                          : "border-white/10 bg-white/5 text-mist"
-                      }`}
-                      key={chip}
-                      type="button"
-                      onClick={() => onAnswers((current) => ({ ...current, carry: chip }))}
-                    >
-                      {chip}
-                    </button>
-                  ))}
-                </div>
+          <div className="rounded-[1.5rem] border border-gold-soft/20 bg-gold-soft/10 p-5">
+            <p className="font-bold text-gold-soft text-xs uppercase tracking-[0.16em]">
+              What I am noticing
+            </p>
+            <ul className="mt-4 grid gap-3 text-starlight leading-6">
+              {activeReport.observations.map((item) => (
+                <li className="flex gap-3" key={item}>
+                  <Stars className="mt-1 shrink-0 text-gold-soft" size={15} />
+                  <span>{item}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            {activeReport.threads.map((thread) => (
+              <div
+                className="rounded-[1.25rem] border border-white/10 bg-white/5 p-4"
+                key={thread.label}
+              >
+                <p className="font-bold text-indigo-soft">{thread.label}</p>
+                <p className="mt-2 text-mist text-sm leading-6">{thread.detail}</p>
               </div>
+            ))}
+          </div>
+
+          <div className="glass rounded-[1.75rem] p-5">
+            <p className="font-serif text-2xl text-starlight">What should the day remember?</p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {reflectionSignals.map((chip) => (
+                <button
+                  className={`rounded-full border px-4 py-2 text-sm ${
+                    answers.proud === chip
+                      ? "border-indigo-soft bg-indigo-soft/20 text-indigo-soft"
+                      : "border-white/10 bg-white/5 text-mist"
+                  }`}
+                  key={chip}
+                  type="button"
+                  onClick={() => onAnswers((current) => ({ ...current, proud: chip }))}
+                >
+                  {chip}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="glass rounded-[1.75rem] p-5">
+            <p className="font-serif text-2xl text-starlight">Carry into tomorrow</p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {carryChoices.map((chip) => (
+                <button
+                  className={`rounded-full border px-4 py-2 text-sm ${
+                    answers.carry === chip
+                      ? "border-indigo-soft bg-indigo-soft/20 text-indigo-soft"
+                      : "border-white/10 bg-white/5 text-mist"
+                  }`}
+                  key={chip}
+                  type="button"
+                  onClick={() => onAnswers((current) => ({ ...current, carry: chip }))}
+                >
+                  {chip}
+                </button>
+              ))}
             </div>
           </div>
         </div>
@@ -1142,20 +1364,17 @@ function ReflectPanel({
         <div className="mt-7 flex flex-wrap items-center justify-between gap-4 border-white/10 border-t pt-6">
           <div>
             <p className="font-bold text-dim text-xs uppercase tracking-[0.18em]">
-              Your evening constellation
+              Guided reflection
             </p>
-            <p className="mt-2 text-mist">
-              {"★".repeat(Math.min(answered, 4))}
-              {"☆".repeat(Math.max(0, 4 - answered))} {answered} of 4 reflections gathered.
-            </p>
+            <p className="mt-2 text-mist">{reflectionCount} saved reflections.</p>
           </div>
           <button
             className="button-glow rounded-full bg-gradient-to-r from-indigo-deep to-indigo-soft/40 px-7 py-3 font-bold text-indigo-soft"
-            disabled={loading || answered === 0}
+            disabled={loading || reportLoading}
             type="button"
             onClick={onSubmit}
           >
-            {loading ? "Gathering..." : "Gather reflection"}
+            {loading ? "Saving..." : "Save reflection"}
           </button>
         </div>
 
@@ -1165,35 +1384,8 @@ function ReflectPanel({
             {latest.summary}
           </div>
         ) : null}
-        <p className="mt-4 text-dim text-sm">{reflectionCount} saved reflections.</p>
       </div>
     </div>
-  );
-}
-
-function ReflectionPrompt({
-  icon,
-  label,
-  onChange,
-  value,
-}: {
-  icon: ReactNode;
-  label: string;
-  onChange: (value: string) => void;
-  value: string;
-}) {
-  return (
-    <label className="glass block rounded-[1.75rem] p-5">
-      <span className="flex items-center gap-3 font-serif text-2xl text-starlight">
-        <span className="text-indigo-soft">{icon}</span>
-        {label}
-      </span>
-      <textarea
-        className="mt-4 min-h-24 w-full resize-y rounded-[1.25rem] border border-white/10 bg-white/5 p-4 text-starlight outline-none transition focus:border-indigo-soft"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </label>
   );
 }
 
@@ -1238,13 +1430,13 @@ function DesktopModeSwitcher({
     screen: Screen;
     label: string;
     icon: ReactNode;
-    badge?: string | undefined;
+    badge?: string;
   }> = [
     {
       screen: "capture",
       label: "Scatter",
       icon: <Sparkles size={16} />,
-      badge: memoryCount > 0 ? String(memoryCount) : undefined,
+      ...(memoryCount > 0 ? { badge: String(memoryCount) } : {}),
     },
     {
       screen: "focus",
@@ -1274,7 +1466,7 @@ function DesktopModeSwitcher({
                 ? "bg-indigo-soft text-indigo-deep shadow-[0_0_18px_rgba(190,194,255,0.18)]"
                 : "text-dim hover:bg-white/5 hover:text-starlight"
             }`}
-            aria-current={active ? "page" : undefined}
+            aria-pressed={active}
             onClick={() => onScreen(item.screen)}
           >
             {item.icon}
@@ -1340,7 +1532,7 @@ function AgentDrawer({
   task,
   user,
 }: {
-  agent: Screen;
+  agent: ChatAgent;
   chatOpen: boolean;
   dumpText: string;
   messages: ChatMessage[];
