@@ -61,6 +61,8 @@ type ReflectionState = {
   } | null;
 };
 
+type ReflectionEntry = NonNullable<ReflectionState["latest"]>;
+
 type MemoryState = {
   count: number;
   latest: {
@@ -174,6 +176,17 @@ const featureCards = [
   },
 ];
 
+function localDayWindow() {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+
+  return {
+    start: start.toISOString(),
+    end: end.toISOString(),
+  };
+}
+
 export function App() {
   const queryClient = useQueryClient();
   const [screen, setScreen] = useState<Screen>(() =>
@@ -216,8 +229,9 @@ export function App() {
   const user = meQuery.data?.user ?? null;
   const task = stateQuery.data?.task ?? null;
   const memory = stateQuery.data?.memory ?? { count: 0, latest: null };
+  const todayWindow = useMemo(() => localDayWindow(), []);
   const categorizedMemoriesQuery = useQuery({
-    queryKey: ["memories", "categorized"],
+    queryKey: ["memories", "categorized", user?.id],
     enabled: Boolean(user && screen === "thoughts"),
     queryFn: () =>
       api<{
@@ -228,10 +242,17 @@ export function App() {
       }>("/api/memories/categorized"),
   });
   const dailyReportQuery = useQuery({
-    queryKey: ["reflect", "report"],
+    queryKey: ["reflect", "report", user?.id, todayWindow.start],
     enabled: Boolean(user && screen === "reflect"),
     queryFn: () =>
-      api<{ report: DailyReport; usedModel: boolean; example: boolean }>("/api/reflect/report"),
+      api<{ report: DailyReport; usedModel: boolean; example: boolean }>(
+        `/api/reflect/report?since=${encodeURIComponent(todayWindow.start)}&until=${encodeURIComponent(todayWindow.end)}`,
+      ),
+  });
+  const reflectionHistoryQuery = useQuery({
+    queryKey: ["reflections", user?.id],
+    enabled: Boolean(user && screen === "reflect"),
+    queryFn: () => api<{ reflections: ReflectionEntry[] }>("/api/reflections"),
   });
 
   useEffect(() => {
@@ -309,7 +330,28 @@ export function App() {
         task: current?.task ?? null,
         memory: data.memoryState,
       }));
+      queryClient.invalidateQueries({ queryKey: ["memories", "categorized"] });
       setDumpText("");
+    },
+  });
+
+  const photoMutation = useMutation({
+    mutationFn: (imageDataUrl: string) =>
+      api<{
+        memory: MemoryState["latest"];
+        memoryState: MemoryState;
+        note: string;
+      }>("/api/capture/photo", {
+        method: "POST",
+        body: JSON.stringify({ imageDataUrl }),
+      }),
+    onSuccess: (data) => {
+      queryClient.setQueryData<AppState | undefined>(["state"], (current) => ({
+        reflection: current?.reflection ?? { count: 0, latest: null },
+        task: current?.task ?? null,
+        memory: data.memoryState,
+      }));
+      queryClient.invalidateQueries({ queryKey: ["memories", "categorized"] });
     },
   });
 
@@ -344,7 +386,10 @@ export function App() {
           carryForward: reflectionAnswers.carry,
         }),
       }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["state"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["state"] });
+      queryClient.invalidateQueries({ queryKey: ["reflections"] });
+    },
   });
 
   const toggleStepMutation = useMutation({
@@ -448,13 +493,15 @@ export function App() {
           {user && screen === "capture" ? (
             <CapturePanel
               dumpText={dumpText}
-              error={memoryMutation.error?.message}
+              error={memoryMutation.error?.message ?? photoMutation.error?.message}
               line={supportLine}
               loading={memoryMutation.isPending}
               memory={memory}
               model={configQuery.data?.model ?? "gemini-3.5-flash"}
+              photoLoading={photoMutation.isPending}
               user={user}
               onChange={setDumpText}
+              onPhotoCapture={(imageDataUrl) => photoMutation.mutate(imageDataUrl)}
               onSubmit={() => memoryMutation.mutate(dumpText)}
               onViewThoughts={() => setScreen("thoughts")}
               onLogout={() => logoutMutation.mutate()}
@@ -469,12 +516,15 @@ export function App() {
               total={categorizedMemoriesQuery.data?.total ?? 0}
               usedModel={categorizedMemoriesQuery.data?.usedModel ?? false}
               onBack={() => setScreen("capture")}
+              onStartThought={(content) => triageMutation.mutate(content)}
+              startingFlow={triageMutation.isPending}
             />
           ) : null}
 
           {user && screen === "focus" && task ? (
             <FocusPanel
               task={task}
+              onChooseThought={() => setScreen("thoughts")}
               onReflect={() => setScreen("reflect")}
               user={user}
               onNewDump={() => setScreen("capture")}
@@ -505,6 +555,7 @@ export function App() {
               latest={stateQuery.data?.reflection.latest ?? null}
               report={dailyReportQuery.data?.report ?? null}
               reportLoading={dailyReportQuery.isLoading}
+              history={reflectionHistoryQuery.data?.reflections ?? []}
               loading={reflectionMutation.isPending}
               reflectionCount={stateQuery.data?.reflection.count ?? 0}
               user={user}
@@ -775,8 +826,10 @@ function CapturePanel({
   model,
   onChange,
   onLogout,
+  onPhotoCapture,
   onSubmit,
   onViewThoughts,
+  photoLoading,
   user,
 }: {
   dumpText: string;
@@ -787,15 +840,32 @@ function CapturePanel({
   model: string;
   onChange: (value: string) => void;
   onLogout: () => void;
+  onPhotoCapture: (imageDataUrl: string) => void;
   onSubmit: () => void;
   onViewThoughts: () => void;
+  photoLoading: boolean;
   user: User;
 }) {
+  const photoInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
+
+  const handlePhotoFile = (file: File | undefined) => {
+    if (!file) {
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        onPhotoCapture(reader.result);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
 
   return (
     <div className="mx-auto max-w-[430px] md:max-w-[900px]">
@@ -873,6 +943,17 @@ function CapturePanel({
           <span className="text-dim text-xs">{model}</span>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2">
+          <input
+            ref={photoInputRef}
+            type="file"
+            className="hidden"
+            accept="image/png,image/jpeg,image/webp"
+            capture="environment"
+            onChange={(event) => {
+              handlePhotoFile(event.currentTarget.files?.[0]);
+              event.currentTarget.value = "";
+            }}
+          />
           <button
             type="button"
             className="inline-flex items-center justify-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-3 font-bold text-dim text-sm"
@@ -884,12 +965,12 @@ function CapturePanel({
           </button>
           <button
             type="button"
-            className="inline-flex items-center justify-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-3 font-bold text-dim text-sm"
-            disabled
-            title="Photo capture is a demo placeholder."
+            className="inline-flex items-center justify-center gap-2 rounded-full border border-indigo-soft/25 bg-indigo-soft/10 px-4 py-3 font-bold text-indigo-soft text-sm disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={photoLoading}
+            onClick={() => photoInputRef.current?.click()}
           >
             <Camera size={17} />
-            Photo
+            {photoLoading ? "Reading..." : "Photo"}
           </button>
         </div>
         <button
@@ -926,6 +1007,8 @@ function ThoughtsPanel({
   error,
   loading,
   onBack,
+  onStartThought,
+  startingFlow,
   total,
   usedModel,
 }: {
@@ -933,6 +1016,8 @@ function ThoughtsPanel({
   error: string | undefined;
   loading: boolean;
   onBack: () => void;
+  onStartThought: (content: string) => void;
+  startingFlow: boolean;
   total: number;
   usedModel: boolean;
 }) {
@@ -996,10 +1081,19 @@ function ThoughtsPanel({
                 <div className="mt-4 grid gap-3">
                   {category.memories.map((memory) => (
                     <article
-                      className="rounded-[1rem] border border-white/10 bg-night/60 p-3 text-mist text-sm leading-6"
+                      className="rounded-[1rem] border border-white/10 bg-night/60 p-3"
                       key={memory.id}
                     >
-                      {memory.content}
+                      <p className="text-mist text-sm leading-6">{memory.content}</p>
+                      <button
+                        type="button"
+                        className="mt-3 inline-flex items-center gap-2 rounded-full border border-indigo-soft/30 bg-indigo-soft/10 px-3 py-1.5 font-bold text-indigo-soft text-xs disabled:cursor-not-allowed disabled:opacity-60"
+                        disabled={startingFlow}
+                        onClick={() => onStartThought(memory.content)}
+                      >
+                        <ArrowRight size={13} />
+                        {startingFlow ? "Starting..." : "Start Flow"}
+                      </button>
                     </article>
                   ))}
                 </div>
@@ -1103,6 +1197,7 @@ function FlowStartPanel({
 }
 
 function FocusPanel({
+  onChooseThought,
   onLogout,
   onNewDump,
   onReflect,
@@ -1110,6 +1205,7 @@ function FocusPanel({
   task,
   user,
 }: {
+  onChooseThought: () => void;
   onLogout: () => void;
   onNewDump: () => void;
   onReflect: () => void;
@@ -1153,6 +1249,24 @@ function FocusPanel({
             aria-label="New dump"
           >
             <MoreVertical size={18} />
+          </button>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-full border border-indigo-soft/25 bg-indigo-soft/10 px-3 py-1.5 font-bold text-indigo-soft text-xs"
+            onClick={onChooseThought}
+          >
+            <Sparkles size={13} />
+            Choose another thought
+          </button>
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1.5 font-bold text-dim text-xs"
+            onClick={onNewDump}
+          >
+            <Zap size={13} />
+            New Scatter
           </button>
         </div>
       </div>
@@ -1233,6 +1347,7 @@ function FocusPanel({
 function ReflectPanel({
   answers,
   error,
+  history,
   latest,
   loading,
   onAnswers,
@@ -1245,6 +1360,7 @@ function ReflectPanel({
 }: {
   answers: { tried: string; hard: string; proud: string; carry: string };
   error: string | undefined;
+  history: ReflectionEntry[];
   latest: ReflectionState["latest"];
   loading: boolean;
   onAnswers: Dispatch<
@@ -1259,6 +1375,20 @@ function ReflectPanel({
 }) {
   const reflectionSignals = ["I showed up", "I made something visible", "I came back gently"];
   const carryChoices = ["Showing up counts", "Quiet Focus", "Self-Kindness", "One next step"];
+  const historyByDay = useMemo(() => {
+    const groups = new Map<string, ReflectionEntry[]>();
+
+    for (const reflection of history) {
+      const day = new Date(reflection.createdAt).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        weekday: "short",
+      });
+      groups.set(day, [...(groups.get(day) ?? []), reflection]);
+    }
+
+    return [...groups.entries()];
+  }, [history]);
   const activeReport =
     report ??
     ({
@@ -1382,6 +1512,41 @@ function ReflectPanel({
         {latest?.summary ? (
           <div className="mt-6 whitespace-pre-wrap rounded-[1.5rem] border border-gold-soft/20 bg-gold-soft/10 p-5 text-gold-soft leading-7">
             {latest.summary}
+          </div>
+        ) : null}
+
+        {historyByDay.length > 0 ? (
+          <div className="mt-7 border-white/10 border-t pt-6">
+            <p className="font-bold text-indigo-soft text-sm uppercase tracking-[0.18em]">
+              Reflection history
+            </p>
+            <div className="mt-4 grid gap-4">
+              {historyByDay.map(([day, entries]) => (
+                <section
+                  className="rounded-[1.5rem] border border-white/10 bg-white/5 p-4"
+                  key={day}
+                >
+                  <p className="font-bold text-starlight">{day}</p>
+                  <div className="mt-3 grid gap-3">
+                    {entries.map((entry) => (
+                      <article
+                        className="rounded-[1rem] border border-white/10 bg-night/50 p-3 text-sm"
+                        key={entry.id}
+                      >
+                        {entry.summary ? (
+                          <p className="whitespace-pre-wrap text-mist leading-6">{entry.summary}</p>
+                        ) : null}
+                        {entry.carryForward ? (
+                          <p className="mt-2 font-bold text-gold-soft">
+                            Carry forward: {entry.carryForward}
+                          </p>
+                        ) : null}
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </div>
           </div>
         ) : null}
       </div>

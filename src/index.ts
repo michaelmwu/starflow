@@ -7,7 +7,7 @@ import {
   GoogleGenAI,
   Type,
 } from "@google/genai";
-import { and, count, desc, eq, gte, sql } from "drizzle-orm";
+import { and, count, desc, eq, gte, lt, sql } from "drizzle-orm";
 import { OAuth2Client } from "google-auth-library";
 import { type Context, Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -62,6 +62,30 @@ type MemoryCategoryResult = {
     memory_ids?: string[];
   }>;
 };
+
+type CategorizedMemory = {
+  id: string;
+  content: string;
+  createdAt: string;
+};
+
+type CategorizedMemoryGroup = {
+  name: string;
+  summary: string;
+  memories: CategorizedMemory[];
+};
+
+const memoryCategoryCache = new Map<
+  string,
+  {
+    categories: CategorizedMemoryGroup[];
+    expiresAt: number;
+    latestId: string | null;
+    model: string | null;
+    total: number;
+    usedModel: boolean;
+  }
+>();
 
 function envValue(name: string): string | undefined {
   const value = process.env[name]?.trim();
@@ -532,6 +556,17 @@ function dailyReportSchema() {
   };
 }
 
+function photoCaptureSchema() {
+  return {
+    type: Type.OBJECT,
+    properties: {
+      memory_text: { type: Type.STRING },
+      note: { type: Type.STRING },
+    },
+    required: ["memory_text", "note"],
+  };
+}
+
 function memoryCategoriesSchema() {
   return {
     type: Type.OBJECT,
@@ -788,6 +823,22 @@ async function loadReflectionState(userId: string) {
   };
 }
 
+async function loadReflections(userId: string, limit = 30) {
+  const rows = await db
+    .select()
+    .from(reflections)
+    .where(eq(reflections.userId, userId))
+    .orderBy(desc(reflections.createdAt))
+    .limit(limit);
+
+  return rows.map((reflection) => ({
+    id: reflection.id,
+    summary: reflection.summary,
+    carryForward: reflection.carryForward,
+    createdAt: reflection.createdAt.toISOString(),
+  }));
+}
+
 async function loadMemoryState(userId: string) {
   const [total] = await db
     .select({ value: count() })
@@ -812,17 +863,41 @@ async function loadMemoryState(userId: string) {
   };
 }
 
-async function loadScatterMemories(userId: string, limit = 60) {
+async function loadScatterMemories(
+  userId: string,
+  limit = 60,
+  window?: { since: Date; until: Date },
+) {
+  const predicates = [eq(agentMemories.userId, userId), eq(agentMemories.sourceKind, "manual")];
+
+  if (window) {
+    predicates.push(gte(agentMemories.createdAt, window.since));
+    predicates.push(lt(agentMemories.createdAt, window.until));
+  }
+
   return db
     .select()
     .from(agentMemories)
-    .where(and(eq(agentMemories.userId, userId), eq(agentMemories.sourceKind, "manual")))
+    .where(and(...predicates))
     .orderBy(desc(agentMemories.createdAt))
     .limit(limit);
 }
 
 function memorySnippet(content: string): string {
   return content.length > 180 ? `${content.slice(0, 177)}...` : content;
+}
+
+function parseImageDataUrl(dataUrl: string) {
+  const match = dataUrl.match(/^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=]+)$/);
+
+  if (!match?.[1] || !match[2]) {
+    return null;
+  }
+
+  return {
+    mimeType: match[1] === "image/jpg" ? "image/jpeg" : match[1],
+    data: match[2],
+  };
 }
 
 function localMemoryCategory(content: string): string {
@@ -966,11 +1041,27 @@ function exampleDailyReport() {
   };
 }
 
-async function generateDailyReport(userId: string) {
+function parseDateWindow(sinceValue: string | null, untilValue: string | null) {
+  if (!sinceValue || !untilValue) {
+    return null;
+  }
+
+  const since = new Date(sinceValue);
+  const until = new Date(untilValue);
+
+  if (Number.isNaN(since.getTime()) || Number.isNaN(until.getTime()) || since >= until) {
+    return null;
+  }
+
+  return { since, until };
+}
+
+async function generateDailyReport(userId: string, window?: { since: Date; until: Date }) {
   const [memories, task] = await Promise.all([
-    loadScatterMemories(userId, 12),
+    loadScatterMemories(userId, 12, window),
     loadOpenTask(userId),
   ]);
+  const memoryWindowLabel = window ? "today" : "recently";
 
   if (memories.length === 0 && !task) {
     return { report: exampleDailyReport(), usedModel: false, example: true };
@@ -982,7 +1073,7 @@ async function generateDailyReport(userId: string) {
       report: {
         ...report,
         observations: [
-          `${memories.length} Scatter thought${memories.length === 1 ? "" : "s"} saved today.`,
+          `${memories.length} Scatter thought${memories.length === 1 ? "" : "s"} saved ${memoryWindowLabel}.`,
           task ? `Current Flow focus: ${task.title}.` : "Flow is ready when you pick a thought.",
           "You showed up by making the invisible visible.",
         ],
@@ -996,6 +1087,7 @@ async function generateDailyReport(userId: string) {
     "Create a gentle daily map for a Starflow user from Scatter memories and Flow state.",
     "Avoid clinical labels. Do not mention diagnosis. Be warm, concrete, and brief.",
     "Include encouragement like: you did great, you showed up.",
+    `Treat the Scatter memories as the user's ${memoryWindowLabel} activity.`,
     `Scatter memories:\n${
       memories.length > 0
         ? memories.map((memory) => `- ${memorySnippet(memory.content)}`).join("\n")
@@ -1019,7 +1111,7 @@ async function generateDailyReport(userId: string) {
         responseMimeType: "application/json",
         responseSchema: dailyReportSchema(),
         temperature: 0.35,
-        maxOutputTokens: 2_000,
+        maxOutputTokens: 1_400,
       },
     });
     const parsed = parseModelJson<{
@@ -1156,6 +1248,12 @@ function focusToolDeclarations(): FunctionDeclaration[] {
         properties: {
           title: { type: "string" },
           why_it_matters: { type: "string" },
+          steps: {
+            type: "array",
+            description:
+              "Optional 4 to 6 replacement steps when the task meaning changes substantially.",
+            items: { type: "string" },
+          },
         },
         required: ["title"],
       },
@@ -1761,6 +1859,8 @@ app.post("/api/memories", async (c) => {
     throw new Error("Memory insert did not return a row.");
   }
 
+  memoryCategoryCache.delete(user.id);
+
   const memoryState = await loadMemoryState(user.id);
   return c.json({
     memory: {
@@ -1772,6 +1872,104 @@ app.post("/api/memories", async (c) => {
   });
 });
 
+app.post("/api/capture/photo", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before saving a photo memory." }, 401);
+  }
+
+  const body = await c.req.json<{ imageDataUrl?: unknown }>();
+
+  if (typeof body.imageDataUrl !== "string" || body.imageDataUrl.length === 0) {
+    return c.json({ error: "Photo data is required." }, 400);
+  }
+
+  if (body.imageDataUrl.length > 10_000_000) {
+    return c.json({ error: "Photo is too large. Try a smaller image." }, 413);
+  }
+
+  const image = parseImageDataUrl(body.imageDataUrl);
+
+  if (!image) {
+    return c.json({ error: "Photo must be a PNG, JPEG, or WebP data URL." }, 400);
+  }
+
+  if (!hasUsableCredentials()) {
+    return c.json(
+      { error: "Gemini is not configured yet. Photo capture needs a Gemini key." },
+      503,
+    );
+  }
+
+  try {
+    const client = createClient();
+    const contents: Content[] = [
+      {
+        role: "user",
+        parts: [
+          {
+            text: [
+              "Read this photo as a Starflow Scatter capture.",
+              "Write one concise first-person memory text that captures what the user may want to remember or act on.",
+              "Do not diagnose. If the image is ambiguous, describe the visible scene neutrally.",
+            ].join(" "),
+          },
+          { inlineData: { mimeType: image.mimeType, data: image.data } },
+        ],
+      },
+    ];
+    const response = await client.models.generateContent({
+      model: modelName(),
+      contents,
+      config: {
+        systemInstruction:
+          "You are Record and Translate for an ADHD support app. Convert image context into a clear saved thought. Return only JSON.",
+        responseMimeType: "application/json",
+        responseSchema: photoCaptureSchema(),
+        temperature: 0.25,
+        maxOutputTokens: 600,
+      },
+    });
+    const parsed = parseModelJson<{ memory_text?: string; note?: string }>(
+      modelResponseText(response),
+    );
+    const content =
+      parsed.memory_text?.trim() ||
+      "I captured a photo and want Starflow to remember what it shows.";
+    const note = parsed.note?.trim() || "Photo saved to Scatter memory.";
+    const [memory] = await db
+      .insert(agentMemories)
+      .values({
+        userId: user.id,
+        sourceKind: "manual",
+        content,
+        metadata: { surface: "scatter", modality: "photo", note },
+      })
+      .returning();
+
+    if (!memory) {
+      throw new Error("Photo memory insert did not return a row.");
+    }
+
+    memoryCategoryCache.delete(user.id);
+
+    const memoryState = await loadMemoryState(user.id);
+    return c.json({
+      memory: {
+        id: memory.id,
+        content: memory.content,
+        createdAt: memory.createdAt.toISOString(),
+      },
+      memoryState,
+      note,
+    });
+  } catch (error) {
+    logServerError("Photo capture failed.", error);
+    return c.json({ error: "Starflow could not read that photo. Try another image." }, 502);
+  }
+});
+
 app.get("/api/memories/categorized", async (c) => {
   const user = await requireUser(c);
 
@@ -1779,14 +1977,42 @@ app.get("/api/memories/categorized", async (c) => {
     return c.json({ error: "Sign in before viewing Scatter memories." }, 401);
   }
 
+  const memoryState = await loadMemoryState(user.id);
+  const cached = memoryCategoryCache.get(user.id);
+
+  if (
+    cached &&
+    cached.total === memoryState.count &&
+    cached.latestId === memoryState.latest?.id &&
+    cached.expiresAt > Date.now()
+  ) {
+    return c.json({
+      total: cached.total,
+      categories: cached.categories,
+      usedModel: cached.usedModel,
+      model: cached.model,
+      cached: true,
+    });
+  }
+
   const memories = await loadScatterMemories(user.id);
   const result = await categorizeMemories(memories);
-
-  return c.json({
+  const payload = {
     total: memories.length,
     categories: result.categories,
     usedModel: result.usedModel,
     model: result.usedModel ? modelName() : null,
+  };
+
+  memoryCategoryCache.set(user.id, {
+    ...payload,
+    latestId: memoryState.latest?.id ?? null,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  });
+
+  return c.json({
+    ...payload,
+    cached: false,
   });
 });
 
@@ -1812,8 +2038,20 @@ app.get("/api/reflect/report", async (c) => {
     return c.json({ error: "Sign in before loading your reflection map." }, 401);
   }
 
-  const result = await generateDailyReport(user.id);
+  const url = new URL(c.req.url);
+  const window = parseDateWindow(url.searchParams.get("since"), url.searchParams.get("until"));
+  const result = await generateDailyReport(user.id, window ?? undefined);
   return c.json(result);
+});
+
+app.get("/api/reflections", async (c) => {
+  const user = await requireUser(c);
+
+  if (!user) {
+    return c.json({ error: "Sign in before loading reflections." }, 401);
+  }
+
+  return c.json({ reflections: await loadReflections(user.id) });
 });
 
 app.post("/api/reflect", async (c) => {
@@ -2196,6 +2434,9 @@ app.post("/api/chat", async (c) => {
         }
 
         const functionResponseParts = [];
+        const modelParts =
+          response.candidates?.[0]?.content?.parts ??
+          functionCalls.map((call) => ({ functionCall: call }));
 
         for (const call of functionCalls) {
           let response: Record<string, unknown>;
@@ -2233,24 +2474,33 @@ app.post("/api/chat", async (c) => {
           ...contents,
           {
             role: "model",
-            parts: functionCalls.map((call) => ({ functionCall: call })),
+            parts: modelParts,
           },
           { role: "user", parts: functionResponseParts },
         ];
       }
 
       if (!reply) {
-        const finalResponse = await client.models.generateContent({
-          model: modelName(),
-          contents,
-          config: {
-            systemInstruction:
-              "Write one concise Starflow reply after the tools ran. Mention what changed only if useful. Do not output JSON.",
-            temperature: 0.35,
-            maxOutputTokens: 800,
-          },
-        });
-        reply = modelResponseText(finalResponse) ?? "";
+        try {
+          const finalResponse = await client.models.generateContent({
+            model: modelName(),
+            contents,
+            config: {
+              systemInstruction:
+                "Write one concise Starflow reply after the tools ran. Mention what changed only if useful. Do not output JSON.",
+              temperature: 0.35,
+              maxOutputTokens: 800,
+            },
+          });
+          reply = modelResponseText(finalResponse) ?? "";
+        } catch (error) {
+          if (updatedTask || Object.keys(uiPatch).length > 0) {
+            logServerError("Final chat reply failed after tools ran.", error);
+            reply = "Done. I updated the screen.";
+          } else {
+            throw error;
+          }
+        }
       }
 
       return c.json({
@@ -2311,6 +2561,7 @@ sessionSecret();
 Bun.serve({
   hostname: "0.0.0.0",
   port,
+  idleTimeout: 60,
   fetch: app.fetch,
 });
 
