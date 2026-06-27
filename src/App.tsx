@@ -378,10 +378,18 @@ export function App() {
           <div className="mx-auto mb-6 hidden max-w-[720px] text-center md:block">
             <h2 className="font-serif text-4xl text-indigo-soft md:text-5xl">Try the loop now.</h2>
             <p className="mt-4 text-mist">
-              Dump the mess, get one main quest, and let the page agent shrink the plan when it
-              feels too large.
+              Move between Scatter, Flow, and Reflect without losing your place.
             </p>
           </div>
+
+          {user ? (
+            <DesktopModeSwitcher
+              memoryCount={memory.count}
+              screen={screen}
+              task={task}
+              onScreen={handleScreen}
+            />
+          ) : null}
 
           {!user ? (
             <SigninPanel
@@ -1187,7 +1195,7 @@ function ReflectionPrompt({
 }
 
 function BottomNav({ onScreen, screen }: { onScreen: (screen: Screen) => void; screen: Screen }) {
-  const items: Array<{ screen: Screen; label: string; icon: ReactNode; disabled?: boolean }> = [
+  const items: Array<{ screen: Screen; label: string; icon: ReactNode }> = [
     { screen: "capture", label: "Scatter", icon: <Sparkles size={19} /> },
     { screen: "focus", label: "Flow", icon: <CheckCircle2 size={19} /> },
     { screen: "reflect", label: "Reflect", icon: <Moon size={19} /> },
@@ -1200,9 +1208,8 @@ function BottomNav({ onScreen, screen }: { onScreen: (screen: Screen) => void; s
           className={`flex flex-col items-center gap-1 rounded-full px-3 py-2 text-xs ${
             screen === item.screen
               ? "bg-indigo-soft/20 text-indigo-soft"
-              : "text-dim disabled:opacity-40"
+              : "text-dim hover:text-starlight"
           }`}
-          disabled={item.disabled}
           key={item.screen}
           type="button"
           onClick={() => onScreen(item.screen)}
@@ -1211,6 +1218,81 @@ function BottomNav({ onScreen, screen }: { onScreen: (screen: Screen) => void; s
           {item.label}
         </button>
       ))}
+    </nav>
+  );
+}
+
+function DesktopModeSwitcher({
+  memoryCount,
+  onScreen,
+  screen,
+  task,
+}: {
+  memoryCount: number;
+  onScreen: (screen: Screen) => void;
+  screen: Screen;
+  task: FocusTask | null;
+}) {
+  const items: Array<{
+    screen: Screen;
+    label: string;
+    description: string;
+    icon: ReactNode;
+    meta: string;
+  }> = [
+    {
+      screen: "capture",
+      label: "Scatter",
+      description: "Save the thought",
+      icon: <Sparkles size={20} />,
+      meta: `${memoryCount} remembered`,
+    },
+    {
+      screen: "focus",
+      label: "Flow",
+      description: "Triage into steps",
+      icon: <CheckCircle2 size={20} />,
+      meta: task ? "Task active" : "Ready when saved",
+    },
+    {
+      screen: "reflect",
+      label: "Reflect",
+      description: "Notice the pattern",
+      icon: <Moon size={20} />,
+      meta: "Daily signal",
+    },
+  ];
+
+  return (
+    <nav className="mx-auto mb-8 hidden max-w-[880px] grid-cols-3 gap-3 md:grid">
+      {items.map((item) => {
+        const active = screen === item.screen;
+        return (
+          <button
+            type="button"
+            key={item.screen}
+            className={`rounded-[1.25rem] border p-4 text-left transition ${
+              active
+                ? "border-indigo-soft/50 bg-indigo-soft/15 shadow-[0_0_24px_rgba(190,194,255,0.12)]"
+                : "border-white/10 bg-white/5 hover:border-indigo-soft/30 hover:bg-white/8"
+            }`}
+            onClick={() => onScreen(item.screen)}
+          >
+            <span className="flex items-center justify-between gap-3">
+              <span
+                className={`grid size-10 place-items-center rounded-full ${
+                  active ? "bg-indigo-soft text-indigo-deep" : "bg-indigo-soft/15 text-indigo-soft"
+                }`}
+              >
+                {item.icon}
+              </span>
+              <span className="text-dim text-xs">{item.meta}</span>
+            </span>
+            <span className="mt-4 block font-bold text-starlight">{item.label}</span>
+            <span className="mt-1 block text-dim text-sm">{item.description}</span>
+          </button>
+        );
+      })}
     </nav>
   );
 }
